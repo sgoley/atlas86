@@ -281,7 +281,8 @@ function renderJiraDetail() {
       <div class="who">${esc(c.author)} — ${esc((c.created || '').replace('T', ' ').slice(0, 16))}</div>
       <div class="detail-body-html">${c.body_html || ''}</div>
     </div>`).join('');
-  const trans = (it.transitions || []).map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('');
+  const trans = (it.transitions || []).map(t =>
+    `<button class="act" data-tid="${esc(t.id)}">[ ${esc((t.name || '').toUpperCase())} ]</button>`).join('');
   $('#detail-body').innerHTML = `
     <div class="detail-head">
       <h1>${esc(it.key)} — ${esc(it.summary)}</h1>
@@ -300,10 +301,7 @@ function renderJiraDetail() {
       <div class="btn-row"><button id="cmt-post" class="act primary">[ POST COMMENT ]</button></div>
     </div>
     <div class="detail-section"><h2>TRANSITION STATUS</h2>
-      <div class="btn-row">
-        <select id="trans" ${trans ? '' : 'disabled'}><option value="">— SELECT —</option>${trans}</select>
-        <button id="trans-go" class="act" ${trans ? '' : 'disabled'}>[ APPLY ]</button>
-      </div>
+      <div class="btn-row" id="trans-row">${trans || '<span class="sub">NO TRANSITIONS AVAILABLE</span>'}</div>
     </div>
     <div class="btn-row">
       <button id="d-edit" class="act primary">[ E / EDIT ]</button>
@@ -314,7 +312,8 @@ function renderJiraDetail() {
   $('#d-back').onclick = backToList;
   $('#d-del').onclick = deleteJiraIssue;
   $('#cmt-post').onclick = postComment;
-  $('#trans-go').onclick = applyTransition;
+  document.querySelectorAll('#trans-row .act').forEach(b =>
+    b.addEventListener('click', () => applyTransition(b.dataset.tid)));
 }
 
 function editJiraIssue() {
@@ -345,11 +344,11 @@ async function postComment() {
   await openJiraIssue(it.key);
 }
 
-async function applyTransition() {
-  const it = state.jira.detail, sel = $('#trans');
-  if (!sel || !sel.value) return;
+async function applyTransition(tid) {
+  const it = state.jira.detail;
+  if (!tid) return;
   await api('/api/jira/issue/' + encodeURIComponent(it.key), {
-    method: 'PUT', body: { transition_id: sel.value },
+    method: 'PUT', body: { transition_id: tid },
   });
   toast('STATUS TRANSITIONED', 'ok'); blip(1200, .04);
   await openJiraIssue(it.key);
