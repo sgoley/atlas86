@@ -196,14 +196,35 @@ function switchTab(tab) {
 document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
 
 /* ============ JIRA ============ */
+const JQL_PRESETS = [
+  ['ALL ASSIGNED TO ME', 'assignee = currentUser() ORDER BY updated DESC'],
+  ['MY OPEN ISSUES', 'assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC'],
+  ['MY ISSUES THIS SPRINT', 'assignee = currentUser() AND sprint in openSprints() ORDER BY rank'],
+  ['ALL ISSUES THIS SPRINT', 'sprint in openSprints() ORDER BY rank'],
+  ['REPORTED BY ME', 'reporter = currentUser() ORDER BY created DESC'],
+  ['UNASSIGNED', 'assignee is EMPTY AND resolution = Unresolved ORDER BY priority DESC'],
+  ['RESOLVED LAST 7 DAYS', 'resolved >= -7d ORDER BY resolved DESC'],
+];
+
 function renderJiraListHead() {
+  const preset = JQL_PRESETS.some(([, j]) => j === state.jira.jql)
+    ? state.jira.jql : '';
   $('#list-head').innerHTML = `
-    <label>JQL QUERY</label>
+    <label>QUERY</label>
+    <select id="jql-preset">
+      <option value=""${preset === '' ? ' selected' : ''}>— CUSTOM JQL —</option>
+      ${JQL_PRESETS.map(([n, j]) => `<option value="${esc(j)}"${j === preset ? ' selected' : ''}>${n}</option>`).join('')}
+    </select>
     <input id="jql" type="text" value="${esc(state.jira.jql)}" spellcheck="false">
     <div class="btn-row">
       <button id="jrun" class="act primary">[ RUN QUERY ]</button>
       <button id="jnew" class="act">[ NEW ISSUE ]</button>
     </div>`;
+  $('#jql-preset').addEventListener('change', e => {
+    if (!e.target.value) return;
+    $('#jql').value = e.target.value;
+    loadJiraIssues();
+  });
   $('#jql').addEventListener('keydown', e => { if (e.key === 'Enter') loadJiraIssues(); });
   $('#jrun').addEventListener('click', loadJiraIssues);
   $('#jnew').addEventListener('click', newJiraIssue);
