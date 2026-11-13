@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atlas86"
+version = "0.1.0"
+description = "A lightweight local-web Jira + Confluence client with a retro 80s terminal UI"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "atlas86 contributors" }]
+dependencies = [
+    "flask>=3",
+    "atlassian-python-api>=4,<5",
+    "python-dotenv>=1",
+]
+
+[project.scripts]
+atlas86 = "atlas86.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["atlas86"]
+
+[tool.hatch.build.targets.sdist]
+include = ["atlas86", "README.md", "LICENSE"]
