@@ -23,10 +23,10 @@ Requires Python 3.10+.
 
 ```sh
 # with pipx (recommended — keeps it out of your global site-packages)
-pipx install git+https://github.com/USER/atlas86
+pipx install git+https://github.com/sgoley/atlas86
 
 # or with pip, inside a venv
-pip install git+https://github.com/USER/atlas86
+pip install git+https://github.com/sgoley/atlas86
 ```
 
 ## Run
