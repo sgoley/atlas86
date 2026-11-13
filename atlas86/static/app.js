@@ -269,6 +269,8 @@ function renderJiraDetail() {
     <div class="kv">
       <span class="k">ASSIGNEE</span><span class="v">${esc(it.assignee || '—')}</span>
       <span class="k">REPORTER</span><span class="v">${esc(it.reporter || '—')}</span>
+      ${(it.attributes || []).map(a =>
+        `<span class="k">${esc((a.name || '').toUpperCase())}</span><span class="v">${esc(a.value)}</span>`).join('')}
     </div>
     <div class="detail-section"><h2>DESCRIPTION</h2>
       <div class="detail-body-html">${it.description_html || '<i>(empty)</i>'}</div></div>
@@ -708,6 +710,30 @@ function moveSel(dir) {
   const el = $('#list-body .row.sel');
   if (el) el.scrollIntoView({ block: 'nearest' });
 }
+
+/* ============ gutter drag ============ */
+const gutter = $('#gutter');
+const savedW = localStorage.getItem('a86-listw');
+if (savedW) document.documentElement.style.setProperty('--list-w', savedW);
+gutter.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const main = $('#main');
+  const move = ev => {
+    const w = Math.min(Math.max(ev.clientX - main.getBoundingClientRect().left, 220), innerWidth * 0.8);
+    document.documentElement.style.setProperty('--list-w', w + 'px');
+  };
+  const up = () => {
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', up);
+    localStorage.setItem('a86-listw', getComputedStyle(document.documentElement).getPropertyValue('--list-w'));
+  };
+  document.addEventListener('pointermove', move);
+  document.addEventListener('pointerup', up);
+});
+gutter.addEventListener('dblclick', () => {
+  document.documentElement.style.removeProperty('--list-w');
+  localStorage.removeItem('a86-listw');
+});
 
 /* ============ go ============ */
 runBoot();

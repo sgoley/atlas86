@@ -26,7 +26,13 @@ class FakeJira:
         }]}
 
     def issue(self, key, fields="*all", expand=None):
-        return {"key": key, "fields": {"summary": "s"},
+        return {"key": key,
+                "fields": {"summary": "s",
+                           "priority": {"name": "High"},
+                           "labels": ["a", "b"],
+                           "customfield_10016": 5.0,
+                           "customfield_10020": [
+                               "com.atlassian.Sprint@1[id=9,name=Sprint 42,state=ACTIVE]"]},
                 "renderedFields": {"description": "<p>d</p>",
                                    "comment": {"comments": [
                                        {"author": {"displayName": "Bo"},
@@ -45,8 +51,9 @@ class FakeConf:
                  "version": {"when": "2026-01-02"}}]
 
     def cql(self, cql, limit=None):
-        return {"results": [{"id": "7", "title": "Hit", "spaceKey": "DOC",
-                             "version": {"when": "2026-01-03"}}]}
+        return {"results": [{"content": {"id": "7", "title": "Hit",
+                                        "spaceKey": "DOC"},
+                             "lastModified": "2026-01-03"}]}
 
     def get_page_by_id(self, page_id, expand=None):
         return {"id": int(page_id), "title": "Page",
@@ -63,6 +70,11 @@ class FakeAtlas:
         self.jira = FakeJira(cfg)
         self.conf = FakeConf()
         FakeAtlas.instances.append(self)
+
+    def field_names(self):
+        return {"priority": "Priority", "labels": "Labels",
+                "customfield_10016": "Story Points",
+                "customfield_10020": "Sprint"}
 
 
 @pytest.fixture
@@ -136,6 +148,20 @@ def test_confluence_search_escapes_quotes(client):
                                       "cloud": False, "token": "t"})
     r = client.get('/api/confluence/pages?q=a%22b%20OR%201%3D1&space=DOC')
     assert r.status_code == 200
+    page = r.get_json()["pages"][0]  # /rest/api/search wraps hits in "content"
+    assert page["id"] == "7" and page["title"] == "Hit"
+    assert page["space"] == "DOC" and page["updated"] == "2026-01-03"
+
+
+def test_jira_issue_attributes(client):
+    client.post("/api/config", json={"url": "https://x", "user": "u",
+                                      "cloud": True, "token": "t"})
+    r = client.get("/api/jira/issue/T-1")
+    attrs = {a["name"]: a["value"] for a in r.get_json()["attributes"]}
+    assert attrs["Priority"] == "High"
+    assert attrs["Labels"] == "a, b"
+    assert attrs["Story Points"] == "5"
+    assert attrs["Sprint"] == "Sprint 42"
 
 
 def test_confluence_page(client):

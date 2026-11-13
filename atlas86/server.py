@@ -16,13 +16,64 @@ def _display(person):
 
 
 def _page_brief(p):
+    # /rest/api/search wraps each hit in {"content": {...}, "lastModified": ...}
+    p, last_mod = (p.get("content") or p), p.get("lastModified")
     space = p.get("space")
     if isinstance(space, dict):
         space = space.get("key")
     version = p.get("version") or {}
+    hist = (p.get("history") or {}).get("lastUpdated")
     return {"id": str(p.get("id")), "title": p.get("title"),
             "space": space or p.get("spaceKey"),
-            "updated": version.get("when") or (p.get("history") or {}).get("lastUpdated")}
+            "updated": version.get("when")
+            or (hist.get("when") if isinstance(hist, dict) else hist)
+            or last_mod}
+
+
+ATTR_STD = {"priority", "created", "duedate", "labels", "components",
+            "fixversions", "resolution"}
+ATTR_PAT = ("sprint", "story point", "epic link", "epic name",
+            "team", "target start", "target end")
+
+
+def _norm(n):
+    return re.sub(r"[^a-z0-9]", "", (n or "").lower())
+
+
+def _attr_val(v, sprint=False):
+    if v is None or v == "" or v == []:
+        return None
+    if isinstance(v, list):
+        parts = [_attr_val(i, sprint) for i in v]
+        return ", ".join(p for p in parts if p) or None
+    if isinstance(v, dict):
+        for k in ("name", "value", "displayName", "key"):
+            if v.get(k):
+                return str(v[k])
+        return None
+    if isinstance(v, str) and sprint:
+        m = re.search(r"name=([^,\]]+)", v)  # greenhopper "Sprint@…[…,name=X,…]"
+        return m.group(1) if m else v
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _issue_attrs(client, fields):
+    try:
+        names = client.field_names()
+    except Exception:
+        names = {}
+    out = []
+    for fid, val in fields.items():
+        label = names.get(fid) or fid
+        low = label.lower()
+        if _norm(label) not in ATTR_STD and not any(p in low for p in ATTR_PAT):
+            continue
+        v = _attr_val(val, sprint="sprint" in low)
+        if v:
+            out.append({"name": label, "value": v})
+    return out
 
 
 def create_app():
@@ -137,6 +188,7 @@ def create_app():
             "description_html": rf.get("description") or "",
             "comments": comments,
             "transitions": transitions,
+            "attributes": _issue_attrs(c, f),
         }
 
     def _jira_write_fields(b):
@@ -202,8 +254,11 @@ def create_app():
     @api
     def conf_spaces():
         data = holder["client"].conf.get_all_spaces() or {}
+        spaces = data.get("results", [])
+        spaces.sort(key=lambda s: (s.get("type") == "personal",
+                                   (s.get("name") or "").lower()))
         return [{"key": s.get("key"), "name": s.get("name")}
-                for s in data.get("results", [])]
+                for s in spaces]
 
     @app.get("/api/confluence/pages")
     @api
