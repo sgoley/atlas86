@@ -403,18 +403,27 @@ async function loadSpaces() {
   renderConfListHead();
 }
 
+function confSpaceOpts(f) {
+  const f_ = (f || '').toLowerCase();
+  return state.conf.spaces
+    .filter(s => !f_ || ((s.key || '') + ' ' + (s.name || '')).toLowerCase().includes(f_))
+    .map(s => `<option value="${esc(s.key)}"${s.key === state.conf.space ? ' selected' : ''}>${esc(s.key)} — ${esc(s.name)}</option>`).join('');
+}
+
 function renderConfListHead() {
-  const opts = state.conf.spaces.map(s =>
-    `<option value="${esc(s.key)}"${s.key === state.conf.space ? ' selected' : ''}>${esc(s.key)} — ${esc(s.name)}</option>`).join('');
   $('#list-head').innerHTML = `
     <label>SPACE</label>
-    <select id="cspace"><option value="">— ALL / NONE —</option>${opts}</select>
+    <input id="csfilter" type="text" placeholder="FILTER SPACES..." spellcheck="false">
+    <select id="cspace"><option value="">— ALL / NONE —</option>${confSpaceOpts()}</select>
     <label>SEARCH TITLE</label>
     <input id="cq" type="text" value="${esc(state.conf.q)}" placeholder="TITLE CONTAINS..." spellcheck="false">
     <div class="btn-row">
       <button id="crun" class="act primary">[ SEARCH ]</button>
       <button id="cnew" class="act">[ NEW PAGE ]</button>
     </div>`;
+  $('#csfilter').addEventListener('input', e => {
+    $('#cspace').innerHTML = '<option value="">— ALL / NONE —</option>' + confSpaceOpts(e.target.value);
+  });
   $('#cspace').addEventListener('change', e => { state.conf.space = e.target.value; loadConfPages(); });
   $('#cq').addEventListener('keydown', e => { if (e.key === 'Enter') loadConfPages(); });
   $('#crun').addEventListener('click', loadConfPages);
@@ -668,7 +677,7 @@ window.addEventListener('keydown', async e => {
     case '?': e.preventDefault(); toggleHelp(true); break;
     case '/': {
       e.preventDefault();
-      const inp = $('#jql') || $('#cq');
+      const inp = $('#jql') || $('#csfilter') || $('#cq');
       if (inp) inp.focus();
       break;
     }

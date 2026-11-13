@@ -253,8 +253,15 @@ def create_app():
     @app.get("/api/confluence/spaces")
     @api
     def conf_spaces():
-        data = holder["client"].conf.get_all_spaces() or {}
-        spaces = data.get("results", [])
+        c = holder["client"].conf
+        spaces, start = [], 0
+        while True:  # get_all_spaces doesn't paginate; loop to a short page
+            page = (c.get_all_spaces(start=start, limit=100) or {}
+                    ).get("results", [])
+            spaces += page
+            if len(page) < 100:
+                break
+            start += 100
         spaces.sort(key=lambda s: (s.get("type") == "personal",
                                    (s.get("name") or "").lower()))
         return [{"key": s.get("key"), "name": s.get("name")}
