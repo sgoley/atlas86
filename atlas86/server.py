@@ -1,4 +1,6 @@
+import re
 from functools import wraps
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, render_template, request
 
@@ -6,6 +8,7 @@ from . import atlas, config
 from .convert import html_to_adf, html_to_wiki, sanitize_html
 
 DEFAULT_JQL = "assignee = currentUser() ORDER BY updated DESC"
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 def _display(person):
@@ -32,6 +35,17 @@ def create_app():
 
     make_client(holder["cfg"])
 
+    @app.before_request
+    def _guard():
+        # the API holds an Atlassian token: refuse DNS-rebinding (foreign Host)
+        # and cross-site browser calls (foreign Origin/Referer on mutations)
+        if urlparse(f"//{request.host}").hostname not in LOOPBACK_HOSTS:
+            return jsonify(error="refused: bad host"), 403
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            src = request.headers.get("Origin") or request.headers.get("Referer")
+            if src and urlparse(src).netloc != request.host:
+                return jsonify(error="refused: cross-site origin"), 403
+
     def api(fn):
         @wraps(fn)
         def w(*a, **kw):
@@ -50,7 +64,8 @@ def create_app():
     def health():
         cfg = config.load_config()
         return {"ok": True, "configured": config.configured(cfg),
-                "url": cfg["url"], "user": cfg["user"], "cloud": cfg["cloud"]}
+                "url": cfg["url"], "user": cfg["user"], "cloud": cfg["cloud"],
+                "warn": _insecure_warn(cfg["url"])}
 
     @app.get("/api/config")
     def get_config():
@@ -69,7 +84,7 @@ def create_app():
         cloud = cloud if isinstance(cloud, bool) else str(cloud).lower() in ("1", "true", "yes", "on")
         config.save_config(url, user, token, cloud)
         make_client(config.load_config())
-        return {"ok": True}
+        return {"ok": True, "warn": _insecure_warn(url)}
 
     # ---------- Jira ----------
 
@@ -194,8 +209,8 @@ def create_app():
     @api
     def conf_pages():
         c = holder["client"].conf
-        space = request.args.get("space") or ""
-        q = request.args.get("q") or ""
+        space = re.sub(r"[^A-Za-z0-9_]", "", request.args.get("space") or "")
+        q = (request.args.get("q") or "").replace('"', "")
         limit = request.args.get("limit", type=int) or 50
         if q:
             cql = f'type=page AND title~"{q}"'
@@ -254,6 +269,12 @@ def create_app():
         return render_template("index.html")
 
     return app
+
+
+def _insecure_warn(url):
+    if url.startswith("http://") and urlparse(url).hostname not in LOOPBACK_HOSTS:
+        return "url is plain http — your token travels in cleartext"
+    return None
 
 
 def main():

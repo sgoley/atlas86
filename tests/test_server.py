@@ -87,7 +87,7 @@ def test_config_roundtrip_never_returns_token(client, tmp_path):
     r = client.post("/api/config", json={
         "url": "https://x.atlassian.net/", "user": "me@x.com",
         "cloud": True, "token": "sekrit"})
-    assert r.get_json() == {"ok": True}
+    assert r.get_json() == {"ok": True, "warn": None}
 
     cfg = client.get("/api/config").get_json()
     assert cfg == {"url": "https://x.atlassian.net", "user": "me@x.com",
@@ -112,6 +112,30 @@ def test_jira_issues_list(client):
     assert data["jql"] == "project=T"
     assert data["issues"][0]["key"] == "T-1"
     assert data["issues"][0]["assignee"] == "Ann"
+
+
+def test_guard_refuses_foreign_host_and_origin(client):
+    assert client.get("/api/health", headers={"Host": "evil.com"}).status_code == 403
+    r = client.post("/api/config", json={"url": "https://x"},
+                    headers={"Origin": "https://evil.com"})
+    assert r.status_code == 403
+    r = client.post("/api/config", json={"url": "https://x"},
+                    headers={"Origin": "http://localhost"})
+    assert r.status_code == 200
+
+
+def test_config_warns_on_plain_http_url(client):
+    r = client.post("/api/config", json={
+        "url": "http://jira.internal", "user": "u", "token": "t"})
+    assert "cleartext" in r.get_json()["warn"]
+    assert "cleartext" in client.get("/api/health").get_json()["warn"]
+
+
+def test_confluence_search_escapes_quotes(client):
+    client.post("/api/config", json={"url": "https://x", "user": "u",
+                                      "cloud": False, "token": "t"})
+    r = client.get('/api/confluence/pages?q=a%22b%20OR%201%3D1&space=DOC')
+    assert r.status_code == 200
 
 
 def test_confluence_page(client):

@@ -547,8 +547,9 @@ async function renderSetup() {
     if (tok) body.token = tok;
     setStatus('WRITING CONFIG...');
     try {
-      await api('/api/config', { method: 'POST', body });
+      const r = await api('/api/config', { method: 'POST', body });
       toast('CONFIG SAVED', 'ok'); blip(1320, .06);
+      if (r.warn) toast('WARN: ' + r.warn.toUpperCase(), 'err');
       const h = await api('/api/health');
       setConn(!!h.configured); state.configured = !!h.configured;
       $('#diag').textContent = h.configured
