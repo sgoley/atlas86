@@ -90,14 +90,15 @@ body {
 /* ---- Main split ---- */
 #main {
   display: grid; grid-template-columns: var(--list-w, minmax(300px, 38%)) 6px 1fr;
+  grid-template-rows: minmax(0, 1fr);
   height: calc(100vh - 52px - 30px);
 }
 body.setup-mode #main { grid-template-columns: 1fr; }
 body.setup-mode #gutter { display: none; }
 #gutter { cursor: col-resize; background: var(--border); }
 #gutter:hover, #gutter:active { background: var(--dim); }
-#list-pane { display: flex; flex-direction: column; background: var(--panel); min-width: 0; }
-#detail-pane { overflow: auto; padding: 14px 18px; }
+#list-pane { display: flex; flex-direction: column; background: var(--panel); min-width: 0; min-height: 0; }
+#detail-pane { overflow: auto; padding: 14px 18px; min-height: 0; }
 
 #list-head { padding: 10px; border-bottom: 2px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
 #list-head label { color: var(--amber); font-size: 11px; letter-spacing: 1px; }
@@ -107,7 +108,7 @@ body.setup-mode #gutter { display: none; }
   padding: 6px 8px; text-transform: none;
 }
 #list-head input:focus, #list-head select:focus { outline: none; border-color: var(--cyan); }
-#list-body { overflow: auto; flex: 1; }
+#list-body { overflow: auto; flex: 1; min-height: 0; }
 
 /* ---- Rows ---- */
 .row {
@@ -245,7 +246,7 @@ textarea.comment-box:focus { outline: none; border-color: var(--cyan); }
 #editor blockquote { border-left: 3px solid var(--cyan); padding-left: 10px; color: var(--dim); }
 
 @media (max-width: 760px) {
-  #main { grid-template-columns: 1fr; grid-template-rows: 45% 1fr; }
+  #main { grid-template-columns: 1fr; grid-template-rows: minmax(0, 45%) minmax(0, 1fr); }
   #gutter { display: none; }
   #list-pane { border-bottom: 2px solid var(--border); }
 }
