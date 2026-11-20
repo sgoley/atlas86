@@ -1,6 +1,7 @@
 import io
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from urllib.parse import quote, urlparse
 
@@ -40,6 +41,14 @@ _EDIT_VAL = {
 
 def _display(person):
     return (person or {}).get("displayName")
+
+
+def _parallel(fns):
+    """Run zero-arg thunks concurrently; each returns its own result/None."""
+    if not fns:
+        return []
+    with ThreadPoolExecutor(max_workers=len(fns)) as ex:
+        return list(ex.map(lambda f: f(), fns))
 
 
 def _ver(client):
@@ -313,7 +322,10 @@ def create_app():
 
     def _issue_detail(key):
         c = holder["client"]
-        issue = c.jira.issue(key, fields="*all", expand="renderedFields") or {}
+        issue, trans = _parallel([
+            lambda: c.jira.issue(key, fields="*all", expand="renderedFields") or {},
+            lambda: c.jira.get_issue_transitions(key) or [],
+        ])
         f = issue.get("fields") or {}
         rf = issue.get("renderedFields") or {}
         comments = [{"author": _display(cm.get("author")),
@@ -322,7 +334,7 @@ def create_app():
                     for cm in (rf.get("comment") or {}).get("comments", [])]
         transitions = [{"id": t.get("id"), "name": t.get("name"),
                         "to": ((t.get("to") or {}).get("name"))}
-                       for t in (c.jira.get_issue_transitions(key) or [])]
+                       for t in trans]
         itype = (f.get("issuetype") or {}).get("name") or ""
         epic = _epic_key(c, f)
         children = None
@@ -741,40 +753,55 @@ def create_app():
 
     def _conf_page_detail(page_id):
         c = holder["client"].conf
-        p = c.get_page_by_id(page_id, expand="body.view,version,space") or {}
-        space = p.get("space") or {}
-        ancestors, children, labels, atts = [], [], [], []
-        try:
-            ancestors = [{"id": str(a.get("id")), "title": a.get("title")}
-                         for a in (c.get_page_ancestors(page_id) or [])]
-        except Exception:
-            pass
-        try:
-            children = [{"id": str(ch.get("id")), "title": ch.get("title")}
+
+        def _page():
+            return c.get_page_by_id(
+                page_id, expand="body.view,version,space") or {}
+
+        def _anc():
+            try:
+                return [{"id": str(a.get("id")), "title": a.get("title")}
+                        for a in (c.get_page_ancestors(page_id) or [])]
+            except Exception:
+                return []
+
+        def _kids():
+            try:
+                return [{"id": str(ch.get("id")), "title": ch.get("title")}
                         for ch in (c.get_child_pages(page_id) or [])
                         if ch.get("type", "page") == "page"]
-        except Exception:
-            pass
-        try:
-            labels = [r.get("name") for r in
-                      ((c.get_page_labels(page_id) or {}).get("results") or [])]
-        except Exception:
-            pass
-        try:
-            res = c.get_attachments_from_content(page_id, limit=100) or {}
-            for a in res.get("results", []):
-                dl = ((a.get("_links") or {}).get("download")) or ""
-                atts.append({
-                    "id": str(a.get("id")),
-                    "filename": a.get("title"),
-                    "mime": (a.get("metadata") or {}).get("mediaType"),
-                    "size": (a.get("extensions") or {}).get("fileSize"),
-                    "version": (a.get("version") or {}).get("number"),
-                    "url": "/api/confluence/attachment?dl=" + quote(dl, safe="")
-                    if dl else None,
-                })
-        except Exception:
-            pass
+            except Exception:
+                return []
+
+        def _labs():
+            try:
+                return [r.get("name") for r in
+                        ((c.get_page_labels(page_id) or {}).get("results") or [])]
+            except Exception:
+                return []
+
+        def _atts():
+            try:
+                res = c.get_attachments_from_content(page_id, limit=100) or {}
+                out = []
+                for a in res.get("results", []):
+                    dl = ((a.get("_links") or {}).get("download")) or ""
+                    out.append({
+                        "id": str(a.get("id")),
+                        "filename": a.get("title"),
+                        "mime": (a.get("metadata") or {}).get("mediaType"),
+                        "size": (a.get("extensions") or {}).get("fileSize"),
+                        "version": (a.get("version") or {}).get("number"),
+                        "url": "/api/confluence/attachment?dl=" + quote(dl, safe="")
+                        if dl else None,
+                    })
+                return out
+            except Exception:
+                return []
+
+        p, ancestors, children, labels, atts = _parallel(
+            [_page, _anc, _kids, _labs, _atts])
+        space = p.get("space") or {}
         return {
             "id": str(p.get("id")),
             "title": p.get("title"),

@@ -1243,6 +1243,7 @@ window.addEventListener('keydown', async e => {
     case 'k': case 'ArrowUp': moveSel(-1); break;
     case 'Enter': {
       if (e.target && e.target.tagName === 'BUTTON') break;
+      if (s.mode === 'detail') break; // already viewing it
       if (s.sel >= 0 && list[s.sel]) {
         if (state.tab === 'jira') openJiraIssue(list[s.sel].key);
         else openConfPage(list[s.sel].id);
