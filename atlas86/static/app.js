@@ -135,7 +135,8 @@ const state = {
           boards: [], board: null, boardCfg: null, sprints: [], sprint: null,
           columns: [], group: 'status', bsel: { s: -1, i: -1 },
           backlog: { sections: [], checked: new Set() },
-          versionsMode: false, versions: null },
+          versionsMode: false, versions: null,
+          reportMode: false, report: null },
   conf: { spaces: [], space: '', pages: [], sel: -1, detail: null, mode: 'list',
           q: '', cql: '', adv: false },
 };
@@ -315,6 +316,30 @@ function renderHome() {
   if (hr) hr.onclick = loadHome;
 }
 
+/* ============ mentions ============ */
+function wireMentions(root) {
+  // wrap @name text nodes in <span class="mention">; text nodes only so
+  // markup from sanitized html is never reparsed
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach(n => {
+    if (!/@[A-Za-z0-9_.-]+/.test(n.nodeValue || '')) return;
+    const frag = document.createDocumentFragment();
+    n.nodeValue.split(/(@[A-Za-z0-9_.-]+)/g).forEach(p => {
+      if (!p) return;
+      if (p[0] === '@' && p.length > 1) {
+        const s = document.createElement('span');
+        s.className = 'mention'; s.textContent = p;
+        frag.appendChild(s);
+      } else {
+        frag.appendChild(document.createTextNode(p));
+      }
+    });
+    n.parentNode.replaceChild(frag, n);
+  });
+}
+
 /* ============ JIRA ============ */
 const JQL_PRESETS = [
   ['ALL ASSIGNED TO ME', 'assignee = currentUser() ORDER BY updated DESC'],
@@ -359,6 +384,7 @@ function renderJiraListHead() {
     </div>
     <div class="btn-row" id="bulk-bar" ${state.jira.bulk ? '' : 'hidden'} style="margin:0">
       <button id="bulk-trans" class="act primary">[ TRANSITION SELECTED ]</button>
+      <button id="bulk-edit" class="act">[ EDIT FIELDS ]</button>
       <span class="sub" id="bulk-count">${state.jira.checked.size} SELECTED</span>
     </div>`;
   document.querySelectorAll('#list-head [data-view]').forEach(b =>
@@ -439,6 +465,70 @@ function renderJiraRows() {
   }));
   const bt = $('#bulk-trans');
   if (bt) bt.onclick = bulkTransition;
+  const be = $('#bulk-edit');
+  if (be) be.onclick = bulkEdit;
+}
+
+function bulkEdit() {
+  const keys = [...state.jira.checked];
+  if (!keys.length) { toast('NOTHING SELECTED', 'err'); return; }
+  openEditor({
+    title: false,
+    fieldsHTML: `
+      <label>APPLY TO ${keys.length} ISSUE(S) — BLANK = UNCHANGED</label>
+      <label>ASSIGNEE (NAME / ACCOUNT ID)</label>
+      <input id="be-assignee" type="text" list="dl-be-users">
+      <datalist id="dl-be-users"></datalist>
+      <label>PRIORITY</label>
+      <input id="be-priority" type="text">
+      <label>DUE DATE</label>
+      <input id="be-duedate" type="date">
+      <label>LABELS ADD (COMMA SEPARATED)</label>
+      <input id="be-labels-add" type="text">
+      <label>LABELS REMOVE (COMMA SEPARATED)</label>
+      <input id="be-labels-remove" type="text">`,
+    html: '',
+    onSave: async () => {
+      const fields = {}, split = v => v.split(',').map(x => x.trim()).filter(Boolean);
+      const who = readField('be-assignee');
+      if (who) fields.assignee = /^[A-Za-z0-9:._-]{8,}$/.test(who) && who.length > 12
+        ? { accountId: who } : who;
+      const pr = readField('be-priority'); if (pr) fields.priority = pr;
+      const dd = readField('be-duedate'); if (dd) fields.duedate = dd;
+      const la = split(readField('be-labels-add'));
+      const lr = split(readField('be-labels-remove'));
+      if (!Object.keys(fields).length && !la.length && !lr.length) {
+        toast('NOTHING TO EDIT', 'err'); throw new Error('validation');
+      }
+      const ok = await confirmDialog('[ BULK EDIT ]',
+        'APPLY TO ' + keys.length + ' ISSUE(S)?\n' + keys.slice(0, 8).join(', ') +
+        (keys.length > 8 ? ' +' + (keys.length - 8) + ' MORE' : ''));
+      if (!ok) throw new Error('cancelled');
+      const body = { keys };
+      if (Object.keys(fields).length) body.fields = fields;
+      if (la.length) body.labels_add = la;
+      if (lr.length) body.labels_remove = lr;
+      const r = await api('/api/jira/bulk/edit', { method: 'POST', body });
+      if (r.errors && r.errors.length) {
+        toast((r.results.length - r.errors.length) + ' OK, ' +
+          r.errors.length + ' FAILED: ' + r.errors[0].error, 'err');
+      } else {
+        toast(keys.length + ' ISSUE(S) UPDATED', 'ok'); blip(1320, .05);
+      }
+      state.jira.checked.clear();
+      await loadJiraIssues();
+    },
+  });
+  const inp = $('#be-assignee');
+  inp && inp.addEventListener('input', async () => {
+    const q = inp.value.trim();
+    if (q.length < 2) return;
+    try {
+      const users = await api('/api/jira/users?q=' + encodeURIComponent(q));
+      $('#dl-be-users').innerHTML = users.map(u =>
+        `<option value="${esc(u.displayName || u.name)}"></option>`).join('');
+    } catch (e) { /* ignore */ }
+  });
 }
 
 async function bulkTransition() {
@@ -516,6 +606,15 @@ function renderJiraDetail() {
     `<div class="link-row"><span class="link-desc">CHILD</span><a class="link-key" data-key="${esc(c.key)}">${esc(c.key)}</a><span class="link-sum">${esc(c.summary || '')} · ${esc(c.status || '')}</span></div>`));
   (it.subtasks || []).forEach(s => hierarchy.push(
     `<div class="link-row"><span class="link-desc">SUBTASK</span><a class="link-key" data-key="${esc(s.key)}">${esc(s.key)}</a><span class="link-sum">${esc(s.summary || '')} · ${esc(s.status || '')}</span></div>`));
+  const history = (it.history || []).slice(0, 30).map(h => `
+    <div class="link-row">
+      <span class="link-desc">${esc((h.when || '').slice(0, 10))}</span>
+      <span class="link-sum">${esc(h.by || '')}: ${(h.items || []).map(i =>
+        `${esc(i.field)}: ${esc(i.from ?? '∅')} → ${esc(i.to ?? '∅')}`).join(' · ')}</span>
+    </div>`).join('');
+  const attrs = (it.attributes || []).map(a => `
+    <span class="k">${esc((a.name || '').toUpperCase())}</span>
+    <span class="v">${esc(a.value)}${a.editable ? ` <button class="act attr-edit" data-fid="${esc(a.id)}" data-val="${esc(a.value)}" data-name="${esc(a.name)}">[E]</button>` : ''}</span>`).join('');
   $('#detail-body').innerHTML = `
     <div class="detail-head">
       <h1>${esc(it.key)} — ${esc(it.summary)}</h1>
@@ -532,16 +631,21 @@ function renderJiraDetail() {
       ${(tt.originalEstimate || tt.remainingEstimate || tt.timeSpent) ? `<span class="k">TIME TRACK</span><span class="v">${esc([tt.timeSpent && 'spent ' + tt.timeSpent, tt.remainingEstimate && 'left ' + tt.remainingEstimate, tt.originalEstimate && 'orig ' + tt.originalEstimate].filter(Boolean).join(' · '))}</span>` : ''}
       ${watches.watchCount != null ? `<span class="k">WATCHERS</span><span class="v">${watches.watchCount}${watches.isWatching ? ' (YOU)' : ''}</span>` : ''}
       ${votes.votes != null ? `<span class="k">VOTES</span><span class="v">${votes.votes}${votes.hasVoted ? ' (YOU)' : ''}</span>` : ''}
-      ${(it.attributes || []).map(a =>
-        `<span class="k">${esc((a.name || '').toUpperCase())}</span><span class="v">${esc(a.value)}</span>`).join('')}
+      ${attrs}
     </div>
     ${hierarchy.length ? `<div class="detail-section"><h2>HIERARCHY</h2>${hierarchy.join('')}</div>` : ''}
     <div class="detail-section"><h2>DESCRIPTION</h2>
       <div class="detail-body-html">${it.description_html || '<i>(empty)</i>'}</div></div>
     <div class="detail-section"><h2>COMMENTS</h2>${comments || '<div class="sub">NO COMMENTS YET.</div>'}
       <textarea id="cmt" class="comment-box" placeholder="WRITE A COMMENT..."></textarea>
+      <div class="link-add">
+        <input id="cmt-user" type="text" list="dl-cmt-users" placeholder="@USER">
+        <datalist id="dl-cmt-users"></datalist>
+        <button id="cmt-men" class="act">[ @ ]</button>
+      </div>
       <div class="btn-row"><button id="cmt-post" class="act primary">[ POST COMMENT ]</button></div>
     </div>
+    ${(it.history || []).length ? `<div class="detail-section"><h2>HISTORY <span class="sub">(${it.history.length})</span></h2>${history}</div>` : ''}
     <div class="detail-section"><h2>TRANSITION STATUS</h2>
       <div class="btn-row" id="trans-row">${trans || '<span class="sub">NO TRANSITIONS AVAILABLE</span>'}</div>
     </div>
@@ -609,8 +713,46 @@ function renderJiraDetail() {
   $('#rl-add').onclick = addRemoteLink;
   $('#wl-add').onclick = addWorklog;
   $('#d-subtask').onclick = newSubtask;
+  wireMentions($('#detail-body'));
+  document.querySelectorAll('.attr-edit').forEach(b =>
+    b.addEventListener('click', () => editCustomField(b.dataset.fid, b.dataset.name, b.dataset.val)));
+  wireCommentMention();
   loadWorklogs(it.key);
   loadLinkTypes(it.key);
+}
+
+async function editCustomField(fid, name, cur) {
+  const it = state.jira.detail;
+  const raw = prompt('NEW VALUE FOR ' + (name || fid).toUpperCase(), cur || '');
+  if (raw === null) return;
+  let v = raw.trim();
+  if (v !== '' && !isNaN(+v)) v = +v;  // keep numeric fields numeric
+  await api('/api/jira/issue/' + encodeURIComponent(it.key), {
+    method: 'PUT', body: { custom_fields: { [fid]: v } },
+  });
+  toast((name || fid).toUpperCase() + ' UPDATED', 'ok');
+  await openJiraIssue(it.key);
+}
+
+function wireCommentMention() {
+  const inp = $('#cmt-user'), dl = $('#dl-cmt-users');
+  if (!inp) return;
+  inp.addEventListener('input', async () => {
+    const q = inp.value.replace(/^@/, '').trim();
+    if (q.length < 2) return;
+    try {
+      const users = await api('/api/jira/users?q=' + encodeURIComponent(q));
+      dl.innerHTML = users.map(u =>
+        `<option value="${esc(u.displayName || u.name)}"></option>`).join('');
+    } catch (e) { /* ignore */ }
+  });
+  $('#cmt-men').onclick = () => {
+    const who = inp.value.replace(/^@/, '').trim();
+    if (!who) { toast('PICK A USER FIRST', 'err'); return; }
+    const ta = $('#cmt'), pos = ta.selectionStart || ta.value.length;
+    ta.value = ta.value.slice(0, pos) + '@' + who + ' ' + ta.value.slice(pos);
+    ta.focus();
+  };
 }
 
 async function loadLinkTypes(key) {
@@ -1013,6 +1155,7 @@ function renderJiraBoardHead() {
     <div class="btn-row">
       <button id="b-load" class="act primary">[ LOAD BOARD ]</button>
       <button id="b-group" class="act">[ GROUP: ${j.group.toUpperCase()} ]</button>
+      ${j.sprint ? `<button id="b-report" class="act">[ ${j.reportMode ? 'BOARD' : 'REPORT'} ]</button>` : ''}
       ${j.boardProject ? `<button id="b-vers" class="act">[ ${j.versionsMode ? 'BOARD' : 'VERSIONS'} ]</button>` : ''}
       ${j.board ? `<button id="b-newsprint" class="act">[ NEW SPRINT ]</button>
       ${j.sprint && j.sprint.state === 'future' ? '<button id="b-start" class="act">[ START ]</button>' : ''}
@@ -1024,6 +1167,7 @@ function renderJiraBoardHead() {
     j.boardProject = e.target.value;
     j.board = null; j.sprints = []; j.sprint = null; j.columns = [];
     j.versionsMode = false; j.versions = null;
+    j.reportMode = false; j.report = null;
     setStatus('FETCHING BOARDS...');
     try {
       j.boards = await api('/api/jira/boards?project=' + encodeURIComponent(j.boardProject));
@@ -1035,6 +1179,7 @@ function renderJiraBoardHead() {
     j.board = j.boards.find(b => String(b.id) === e.target.value) || null;
     j.sprints = []; j.sprint = null; j.columns = [];
     j.versionsMode = false; j.versions = null;
+    j.reportMode = false; j.report = null;
     if (!j.board) { renderJiraBoardHead(); return; }
     setStatus('FETCHING SPRINTS...');
     try {
@@ -1047,6 +1192,7 @@ function renderJiraBoardHead() {
   $('#b-sprint').addEventListener('change', async e => {
     j.sprint = j.sprints.find(s => String(s.id) === e.target.value) || null;
     j.versionsMode = false;
+    j.reportMode = false; j.report = null;
     if (j.sprint) await loadBoard();
     renderJiraBoardHead();
   });
@@ -1057,6 +1203,8 @@ function renderJiraBoardHead() {
   });
   const bv = $('#b-vers');
   if (bv) bv.onclick = toggleVersions;
+  const br = $('#b-report');
+  if (br) br.onclick = toggleReport;
   const ns = $('#b-newsprint');
   if (ns) ns.onclick = async () => {
     const name = prompt('NEW SPRINT NAME');
@@ -1088,6 +1236,40 @@ async function toggleVersions() {
     j.versions = await api('/api/jira/project/' + encodeURIComponent(j.boardProject) + '/versions');
   } catch (e) { j.versions = []; }
   renderVersions();
+}
+
+async function toggleReport() {
+  const j = state.jira;
+  j.reportMode = !j.reportMode;
+  renderJiraBoardHead();
+  if (!j.reportMode) {
+    if (j.columns.length) renderBoard();
+    return;
+  }
+  setStatus('FETCHING SPRINT REPORT...');
+  try {
+    j.report = await api('/api/jira/sprints/' + encodeURIComponent(j.sprint.id) + '/report');
+  } catch (e) { j.report = null; }
+  renderSprintReport();
+}
+
+function renderSprintReport() {
+  const j = state.jira, r = j.report;
+  const vel = (r && r.velocity) || {};
+  $('#detail-body').innerHTML = `
+    <div class="detail-head">
+      <h1>SPRINT REPORT // ${esc(j.sprint ? j.sprint.name : '')}</h1>
+      <div class="sub">${r ? esc(r.name || '') + ' · ' + esc(r.state || '') : 'REPORT UNAVAILABLE'} · [ REPORT ] TOGGLES BACK TO THE BOARD</div>
+    </div>
+    ${r ? `
+    <div class="kv">
+      <span class="k">PERIOD</span><span class="v">${esc((r.startDate || '').slice(0, 10))} → ${esc((r.endDate || '').slice(0, 10))}</span>
+      <span class="k">COMPLETED</span><span class="v">${esc(r.completed ?? '?')}</span>
+      <span class="k">NOT COMPLETED</span><span class="v">${esc(r.notCompleted ?? '?')}</span>
+      <span class="k">PUNTED</span><span class="v">${esc(r.punted ?? '?')}</span>
+      ${vel.avg != null ? `<span class="k">VELOCITY</span><span class="v">AVG ${esc(vel.avg)} · LAST ${esc(vel.complete)} · EST ${esc(vel.estimated)}</span>` : ''}
+    </div>` : '<div class="empty">SPRINT REPORT UNAVAILABLE — THE AGILE API MAY NOT SUPPORT IT ON THIS INSTANCE.</div>'}`;
+  setStatus('SPRINT REPORT LOADED');
 }
 
 function renderVersions() {
@@ -1590,6 +1772,8 @@ function renderConfDetail() {
       ${crumbs ? `<div class="crumbs">ROOT / ${crumbs} / <b>${esc(p.title)}</b></div>` : ''}
       <div class="chips-row">${labels}<input id="label-add" type="text" placeholder="+ LABEL" class="chip-input"></div>
       <div class="btn-row" style="margin-top:4px">
+        <button id="pg-watch" class="act">[ ${p.watching ? 'UNWATCH' : 'WATCH'} ]</button>
+        <button id="pg-fav" class="act">[ ${p.favourite ? '★ FAV' : '☆ FAV'} ]</button>
         <button id="pg-move" class="act">[ MOVE ]</button>
         <button id="pg-copy" class="act">[ COPY ]</button>
         <button id="pg-restr" class="act">[ RESTRICTIONS ]</button>
@@ -1620,6 +1804,21 @@ function renderConfDetail() {
   $('#d-back').onclick = backToList;
   $('#d-del').onclick = deleteConfPage;
   $('#pgcmt-post').onclick = postConfComment;
+  $('#pg-watch').onclick = async () => {
+    await api('/api/confluence/page/' + encodeURIComponent(p.id) + '/watch',
+      { method: p.watching ? 'DELETE' : 'POST', body: {} });
+    toast(p.watching ? 'UNWATCHED' : 'WATCHING PAGE', 'ok');
+    await openConfPage(p.id);
+  };
+  $('#pg-fav').onclick = async () => {
+    try {
+      await api('/api/confluence/page/' + encodeURIComponent(p.id) + '/favourite',
+        { method: p.favourite ? 'DELETE' : 'POST', body: {} });
+      toast(p.favourite ? 'REMOVED FROM FAVOURITES' : 'ADDED TO FAVOURITES', 'ok');
+    } catch (e) { toast('FAVOURITES NOT SUPPORTED HERE', 'err'); }
+    await openConfPage(p.id);
+  };
+  wireMentions($('#detail-body'));
   confReplyTo = null;
   loadConfComments(p.id);
   document.querySelectorAll('.chip-x').forEach(x => x.addEventListener('click', async () => {

@@ -286,8 +286,12 @@ def _issue_attrs(client, fields):
             continue
         label = names.get(fid) or _FIELD_LABELS.get(fid) or fid
         v = _field_text(val)
+        # conservative: scalars round-trip cleanly; dicts/lists (option,
+        # user-picker, multi-value) stay read-only
+        editable = v is not None and isinstance(val, (str, int, float, bool))
         if v:
-            out.append({"name": label, "value": v})
+            out.append({"name": label, "value": v, "id": fid,
+                        "editable": editable})
     return out
 
 
@@ -480,7 +484,8 @@ def create_app():
     def _issue_detail(key):
         c = holder["client"]
         issue, trans_raw, remotes = _parallel([
-            lambda: c.jira.issue(key, fields="*all", expand="renderedFields") or {},
+            lambda: c.jira.issue(key, fields="*all",
+                                 expand="renderedFields,changelog") or {},
             lambda: c.jira.get(
                 f"rest/api/{_ver(c)}/issue/{key}/transitions"
                 "?expand=transitions.fields") or {},
@@ -528,6 +533,14 @@ def create_app():
             aid = a.get("id")
             atts.append({**_attachments_meta([a])[0],
                          "url": f"/api/jira/attachment/{aid}"})
+        history = [{"when": h.get("created"),
+                    "by": _display(h.get("author")),
+                    "items": [{"field": it.get("field"),
+                               "from": it.get("fromString") or it.get("from"),
+                               "to": it.get("toString") or it.get("to")}
+                              for it in (h.get("items") or [])][:10]}
+                   for h in ((issue.get("changelog") or {})
+                             .get("histories") or [])[:50]]
         return {
             "key": issue.get("key") or key,
             "summary": f.get("summary"),
@@ -565,6 +578,7 @@ def create_app():
                               "title": (r.get("object") or {}).get("title"),
                               "url": (r.get("object") or {}).get("url")}
                              for r in remotes if isinstance(r, dict)],
+            "history": history,
         }
 
     @app.get("/api/jira/issue/<key>")
@@ -632,10 +646,9 @@ def create_app():
                 "components": "components", "fixversions": "fixVersions",
                 "environment": "environment", "summary": "summary"}
 
-    def _edit_fields(b):
+    def _edit_fields(raw):
         """Translate friendly field edits into a Jira fields payload."""
         out = {}
-        raw = b.get("fields") or {}
         if not isinstance(raw, dict):
             return out
         for k, v in raw.items():
@@ -663,7 +676,17 @@ def create_app():
             fields["summary"] = b["summary"]
         if "description_html" in b:
             fields.update(_jira_write_fields(b))
-        fields.update(_edit_fields(b))
+        fields.update(_edit_fields(b.get("fields")))
+        cf = b.get("custom_fields")
+        if isinstance(cf, dict):
+            for fid, v in cf.items():
+                if not isinstance(fid, str) or not fid:
+                    continue
+                if isinstance(v, (str, int, float, bool)):
+                    fields[fid] = v
+                else:
+                    return jsonify(error="custom fields only accept "
+                                   "scalar values"), 400
         if fields:
             if holder["cfg"]["cloud"]:
                 c.jira.put(f"rest/api/3/issue/{key}", data={"fields": fields})
@@ -687,6 +710,42 @@ def create_app():
                 c.jira.set_issue_status_by_transition_id(key, tid)
         invalidate()
         return {"ok": True}
+
+    @app.post("/api/jira/bulk/edit")
+    @api
+    def jira_bulk_edit():
+        b = body()
+        keys = b.get("keys") or []
+        if not keys:
+            return jsonify(error="keys required"), 400
+        fields = _edit_fields(b.get("fields"))
+        update = {}
+        la = [str(x) for x in (b.get("labels_add") or []) if str(x).strip()]
+        lr = [str(x) for x in (b.get("labels_remove") or []) if str(x).strip()]
+        if la or lr:
+            update["labels"] = ([{"add": x} for x in la] +
+                                [{"remove": x} for x in lr])
+        if not fields and not update:
+            return jsonify(error="nothing to edit"), 400
+        c = holder["client"]
+        ver = _ver(c)
+        results = []
+        for k in keys[:50]:
+            try:
+                payload = {}
+                if fields:
+                    payload["fields"] = fields
+                if update:
+                    payload["update"] = update
+                c.jira.put(f"rest/api/{ver}/issue/{k}", data=payload)
+                results.append({"key": k, "ok": True})
+            except Exception as e:
+                results.append({"key": k, "ok": False, "error": str(e)})
+        invalidate()
+        fails = [r for r in results if not r["ok"]]
+        return {"ok": not fails, "results": results,
+                "errors": [{"key": r["key"], "error": r["error"]}
+                           for r in fails]}
 
     @app.post("/api/jira/issue/<key>/comment")
     @api
@@ -1035,6 +1094,36 @@ def create_app():
                     "sprint": sprint}
         return cache_wrap("home", 60, fetch)
 
+    @app.get("/api/jira/sprints/<sid>/report")
+    @api
+    def jira_sprint_report(sid):
+        def fetch():
+            c = holder["client"]
+            data = c.jira.get(
+                c.jira.get_agile_resource_url(f"sprint/{sid}/report")) or {}
+            contents = data.get("contents") or {}
+
+            def cnt(v):
+                if isinstance(v, dict):
+                    return v.get("issueCount") or len(v.get("issues") or [])
+                if isinstance(v, list):
+                    return len(v)
+                return v
+            meta = data.get("sprintMeta") or {}
+            vel = data.get("velocityStats") or {}
+            return {"name": meta.get("name"), "state": meta.get("state"),
+                    "startDate": meta.get("startDate"),
+                    "endDate": meta.get("endDate"),
+                    "completed": cnt(contents.get("issuesCompletedInSprint")),
+                    "notCompleted": cnt(contents.get(
+                        "issuesNotCompletedInSprint")),
+                    "punted": cnt(contents.get("issuesPuntedInSprint")),
+                    "velocity": ({"estimated": vel.get("estimated"),
+                                  "complete": vel.get("complete"),
+                                  "avg": vel.get("avg")}
+                                 if vel else None)}
+        return cache_wrap(f"jira:sprintreport:{sid}", 120, fetch)
+
     @app.post("/api/jira/sprints")
     @api
     def jira_sprint_create():
@@ -1215,7 +1304,15 @@ def create_app():
 
         def _page():
             return c.get_page_by_id(
-                page_id, expand="body.view,body.storage,version,space") or {}
+                page_id, expand="body.view,body.storage,version,space,"
+                "metadata.currentuser.favourited") or {}
+
+        def _watch():
+            try:
+                d = c.get(f"rest/api/user/watch/content/{page_id}") or {}
+                return bool(d.get("hasWatch"))
+            except Exception:
+                return None
 
         def _anc():
             try:
@@ -1259,8 +1356,10 @@ def create_app():
             except Exception:
                 return []
 
-        p, ancestors, children, labels, atts = _parallel(
-            [_page, _anc, _kids, _labs, _atts])
+        p, ancestors, children, labels, atts, watching = _parallel(
+            [_page, _anc, _kids, _labs, _atts, _watch])
+        fav = (((p.get("metadata") or {}).get("currentuser") or {})
+               .get("favourited") or {}).get("isFavourite")
         space = p.get("space") or {}
         diagrams = _diagram_previews(
             ((p.get("body") or {}).get("storage") or {}).get("value") or "", atts)
@@ -1289,6 +1388,8 @@ def create_app():
             "labels": labels,
             "attachments": atts,
             "diagrams": diagrams,
+            "watching": watching,
+            "favourite": fav,
         }
 
     @app.get("/api/confluence/page/<page_id>")
@@ -1377,6 +1478,42 @@ def create_app():
     @api
     def conf_comment_del(cid):
         holder["client"].conf.delete(f"rest/api/content/{cid}")
+        invalidate()
+        return {"ok": True}
+
+    @app.post("/api/confluence/page/<page_id>/watch")
+    @api
+    def conf_watch_add(page_id):
+        holder["client"].conf.post(
+            f"rest/api/user/watch/content/{page_id}")
+        invalidate()
+        return {"ok": True}
+
+    @app.delete("/api/confluence/page/<page_id>/watch")
+    @api
+    def conf_watch_del(page_id):
+        holder["client"].conf.delete(
+            f"rest/api/user/watch/content/{page_id}")
+        invalidate()
+        return {"ok": True}
+
+    @app.post("/api/confluence/page/<page_id>/favourite")
+    @api
+    def conf_fav_add(page_id):
+        # experimental relations API: favourite = personal label under the
+        # hood; not present on every server flavour, so best-effort
+        holder["client"].conf.put(
+            f"rest/experimental/relation/user/current/favourite/"
+            f"toContent/{page_id}")
+        invalidate()
+        return {"ok": True}
+
+    @app.delete("/api/confluence/page/<page_id>/favourite")
+    @api
+    def conf_fav_del(page_id):
+        holder["client"].conf.delete(
+            f"rest/experimental/relation/user/current/favourite/"
+            f"toContent/{page_id}")
         invalidate()
         return {"ok": True}
 

@@ -55,7 +55,14 @@ class FakeJira:
                 "renderedFields": {"description": "<p>d</p>",
                                    "comment": {"comments": [
                                        {"author": {"displayName": "Bo"},
-                                        "created": "c", "body": "<p>hi</p>"}]}}}
+                                        "created": "c", "body": "<p>hi</p>"}]}},
+                "changelog": {"histories": [
+                    {"id": "1", "author": {"displayName": "Ann"},
+                     "created": "2026-01-10T10:00:00.000+0000",
+                     "items": [{"field": "status", "fieldtype": "jira",
+                                "fromString": "To Do", "toString": "Done"},
+                               {"field": "priority", "fieldtype": "jira",
+                                "fromString": "Low", "toString": "High"}]}]}}
 
     def get(self, path, **kw):
         self.calls.append(("GET", path, kw))
@@ -89,6 +96,16 @@ class FakeJira:
         if path.endswith("/remotelink"):
             return [{"id": "77", "object": {"url": "https://ex.com/p",
                                            "title": "Ext Page"}}]
+        if "/report" in path:
+            return {"contents": {
+                        "issuesCompletedInSprint": {"issueCount": 4},
+                        "issuesNotCompletedInSprint": {"issueCount": 2},
+                        "issuesPuntedInSprint": {"issueCount": 1}},
+                    "sprintMeta": {"name": "Sprint 1", "state": "closed",
+                                   "startDate": "2026-01-01T00:00:00Z",
+                                   "endDate": "2026-01-14T00:00:00Z"},
+                    "velocityStats": {"estimated": 8, "complete": 5,
+                                      "avg": 6}}
         return {}
 
     def post(self, path, data=None, **kw):
@@ -214,6 +231,8 @@ class FakeConf:
         return {"id": int(page_id), "title": "Page",
                 "space": {"key": "DOC", "name": "Docs"},
                 "version": {"number": 3},
+                "metadata": {"currentuser": {"favourited":
+                                             {"isFavourite": True}}},
                 "ancestors": [{"id": "2", "title": "Mid"}],
                 "body": {"view": {"value": "<p>body</p>"},
                          "storage": {"value":
@@ -264,6 +283,8 @@ class FakeConf:
                                           "by": {"displayName": "Cy"}},
                  "body": {"view": {"value": "<p>reply</p>"}},
                  "ancestors": [{"id": "42"}, {"id": "501"}]}]}
+        if "user/watch/content" in path:
+            return {"hasWatch": True}
         if "version" in path:
             return {"results": [{"number": 3, "when": "2026-01-02T00:00:00Z",
                                  "by": {"displayName": "Ann"}, "message": "edit"}]}
@@ -294,6 +315,10 @@ class FakeConf:
 
     def post(self, path, data=None, **kw):
         self.calls.append(("POST", path, data))
+        return {}
+
+    def put(self, path, data=None, **kw):
+        self.calls.append(("PUT", path, data))
         return {}
 
     def delete(self, path, **kw):
@@ -789,3 +814,74 @@ def test_drawio_svg_extraction():
     # graceful fallback
     assert _drawio_svg(b"not a drawio file") is None
     assert _drawio_svg(b"") is None
+
+
+def test_jira_issue_history(client):
+    _configured(client)
+    d = client.get("/api/jira/issue/T-1").get_json()
+    assert len(d["history"]) == 1
+    h = d["history"][0]
+    assert h["by"] == "Ann" and h["when"].startswith("2026-01-10")
+    assert h["items"][0] == {"field": "status", "from": "To Do",
+                             "to": "Done"}
+
+
+def test_jira_custom_field_scalar_edit(client):
+    _configured(client)
+    r = client.put("/api/jira/issue/T-1",
+                   json={"custom_fields": {"customfield_10016": 8}})
+    assert r.get_json() == {"ok": True}
+    upd = [c for c in FakeAtlas.instances[-1].jira.calls
+           if c[0] == "issue_update"]
+    assert upd[-1][2]["customfield_10016"] == 8
+    # complex values stay read-only
+    r = client.put("/api/jira/issue/T-1",
+                   json={"custom_fields": {"customfield_10020": {"name": "x"}}})
+    assert r.status_code == 400
+
+
+def test_jira_bulk_edit(client):
+    _configured(client)
+    r = client.post("/api/jira/bulk/edit", json={
+        "keys": ["T-1", "T-2"],
+        "fields": {"priority": "High", "duedate": "2026-04-01"},
+        "labels_add": ["sprint42"], "labels_remove": ["old"]})
+    data = r.get_json()
+    assert data["ok"] is True
+    assert [x["key"] for x in data["results"]] == ["T-1", "T-2"]
+    puts = [c for c in FakeAtlas.instances[-1].jira.calls
+            if c[0] == "PUT" and "/issue/T-" in str(c[1])]
+    assert len(puts) == 2
+    payload = puts[0][2]
+    assert payload["fields"]["priority"] == {"name": "High"}
+    assert payload["fields"]["duedate"] == "2026-04-01"
+    assert payload["update"]["labels"] == [{"add": "sprint42"},
+                                            {"remove": "old"}]
+    assert client.post("/api/jira/bulk/edit", json={}).status_code == 400
+
+
+def test_jira_sprint_report(client):
+    _configured(client)
+    r = client.get("/api/jira/sprints/7/report")
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["completed"] == 4 and d["notCompleted"] == 2
+    assert d["punted"] == 1 and d["state"] == "closed"
+    assert d["velocity"] == {"estimated": 8, "complete": 5, "avg": 6}
+
+
+def test_confluence_watch_and_favourite(client):
+    _configured(client)
+    d = client.get("/api/confluence/page/42").get_json()
+    assert d["watching"] is True and d["favourite"] is True
+
+    assert client.post("/api/confluence/page/42/watch",
+                       json={}).get_json() == {"ok": True}
+    assert client.delete("/api/confluence/page/42/watch").get_json() == {"ok": True}
+    assert client.post("/api/confluence/page/42/favourite",
+                       json={}).get_json() == {"ok": True}
+    calls = FakeAtlas.instances[-1].conf.calls
+    assert any(c[0] == "POST" and "user/watch/content/42" in str(c[1])
+               for c in calls)
+    assert any(c[0] == "PUT" and "favourite/toContent/42" in str(c[1])
+               for c in calls)

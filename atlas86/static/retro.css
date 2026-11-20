@@ -301,3 +301,5 @@ textarea.comment-box:focus { outline: none; border-color: var(--cyan); }
 .bl-row.drop { outline: 1px dashed var(--green); outline-offset: -2px; }
 .bl-sec.drop { outline: 1px dashed var(--green); outline-offset: -4px; }
 .link-ext { color: var(--cyan, #5ff); }
+.mention { color: var(--amber); font-weight: bold; }
+.attr-edit { font-size: 10px; padding: 0 4px; margin-left: 4px; }
