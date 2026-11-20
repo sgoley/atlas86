@@ -86,20 +86,23 @@ The mouse works too. We're not monsters.
 - **Jira**: JQL search with presets + saved filters, full issue detail (every
   field, rendered generically), edit summary/description, edit priority /
   assignee / labels / due date / components / fix versions, transitions
-  (including transition-screen fields like Resolution), comments, issue links,
+  (including transition-screen fields like Resolution), comments with
+  @mention rendering + user lookup, issue history (changelog), issue links,
   remote links, watchers, votes, worklog (view/log/edit/delete), attachments
   (view inline + upload), epic/parent/child/subtask hierarchy.
 - **Boards**: pick project → board → sprint, cards grouped by configured
   status columns (or epic swimlanes), drag-and-drop or `[`/`]` moves via the
-  matching transition, sprint create/start/complete, backlog view with
-  sprint sections, checkbox bulk moves, and drag-to-position ranking.
+  matching transition, sprint create/start/complete, sprint report (completed /
+  incomplete / punted + velocity), versions view, backlog view with sprint
+  sections, checkbox bulk transition + bulk field edit, and drag-to-position
+  ranking.
 - **Versions**: per-project fixVersions with issue counts and release state,
   from the board header.
 - **Confluence**: space browse + title search + raw CQL, page tree
   (ancestors/children), labels, page comments (threads, replies, delete),
-  version history, move/copy/restrictions, attachments (inline images +
-  upload), diagram previews (images, drawio→SVG extraction, links),
-  WYSIWYG edit.
+  page watch + favourite, version history, move/copy/restrictions, attachments
+  (inline images + upload), diagram previews (images, drawio→SVG extraction,
+  links), WYSIWYG edit.
 - **Fast**: TTL-cached reads (~0.3ms warm vs ~50ms+ cold upstream),
   virtualized lists, parallel detail fetches. See `docs/PERF.md`.
 
@@ -115,9 +118,13 @@ The mouse works too. We're not monsters.
   Read back in, it all becomes HTML either way.
 - **Tables in Jira descriptions flatten to paragraphs** on save. Cells lose
   their grid.
-- **Field editing covers the common fields only** (priority, assignee, labels,
-  due date, components, fix versions, environment, summary). Custom fields are
-  read-only — their write payloads are too instance-specific to guess.
+- **Field editing covers the common fields plus scalar custom fields.**
+  Priority, assignee, labels, due date, components, fix versions, environment,
+  summary are editable; custom fields are editable only when their value is a
+  plain string/number/boolean — option pickers, user pickers, cascading
+  selects, and multi-value fields stay read-only.
+- **Bulk edit covers transition + assignee/priority/due date/labels** on up
+  to 50 issues. No bulk delete, no bulk move-to-sprint from the issues list.
 - **Board columns follow the board's configured layout** when the agile
   configuration endpoint answers; cards move by workflow transition, so a
   drop only works when a transition targets a status in that column. If the
@@ -134,9 +141,18 @@ The mouse works too. We're not monsters.
   supported.
 - **HOME is a dashboard-lite**, not Jira's full "Your Work" — four fixed
   buckets, no gadgets, filters, or activity streams.
-- **It's a simple client, not a full replacement.** No sprint reports,
-  burndowns, roadmaps, or admin screens. If you need that, go home and use
-  Jira.
+- **Sprint report is stats-only** — completed/incomplete/punted counts and
+  velocity numbers from the agile report endpoint; no burndown chart, no
+  per-issue drill-down.
+- **Page favourites use the experimental relations API** — it works on most
+  Server/DC instances and recent Cloud, but if your flavour doesn't expose it
+  the button toasts an error instead of toggling.
+- **Mentions render as styled spans** in rendered bodies, and the Jira comment
+  box has a user-lookup helper — but there's no real mention notification or
+  autocomplete dropdown.
+- **It's a simple client, not a full replacement.** No Jira dashboards,
+  gadgets, roadmaps, sprint planning poker, or admin screens. If you need
+  that, go home and use Jira.
 
 ## Development
 

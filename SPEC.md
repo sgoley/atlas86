@@ -150,6 +150,35 @@ mutation clears the cache.
   a self-contained phosphor-styled SVG extracted from `.drawio` XML
   (mxGraphModel, inline or base64+zlib compressed; capped 120 cells).
 
+## v0.5 API extensions (parity sweep; same error/JSON rules)
+
+- `GET  /api/jira/issue/<key>` now also returns `history` — up to 50
+  changelog entries `{when, by, items:[{field,from,to}]}` riding the same
+  `issue()` call via `expand=renderedFields,changelog` (no extra upstream).
+- `GET  /api/jira/issue/<key>` `attributes[]` entries now carry `id` (the
+  Jira field id) and `editable` (true only for scalar string/number/bool
+  values; dicts/lists stay read-only).
+- `PUT  /api/jira/issue/<key>` accepts `custom_fields` = `{fieldId: scalar}`
+  — written straight into the `fields` payload. Non-scalar values are
+  rejected 400 (option/user-picker/cascading types are unsupported).
+- `POST /api/jira/bulk/edit` `{keys:[], fields?, labels_add?, labels_remove?}`
+  -> `{ok, results:[{key,ok,error?}], errors:[...]}` — per-key `PUT
+  /issue/{key}` with `fields`/`update.labels` add+remove ops; ≤50 keys,
+  sequential, per-issue failures collected not fatal.
+- `GET  /api/jira/sprints/<id>/report` -> `{name,state,startDate,endDate,
+  completed,notCompleted,punted,velocity:{estimated,complete,avg}|null}` —
+  agile `sprint/{id}/report`, counts normalized from issueCount/issues/len.
+  Cached 120s.
+- `GET  /api/confluence/page/<id>` now also returns `watching` (bool|null,
+  `GET rest/api/user/watch/content/{id}` → `hasWatch`, parallel fetch) and
+  `favourite` (bool|null, `metadata.currentuser.favourited.isFavourite` via
+  expand).
+- `POST|DELETE /api/confluence/page/<id>/watch` ->
+  `rest/api/user/watch/content/{id}` (lib already sends X-Atlassian-Token).
+- `POST|DELETE /api/confluence/page/<id>/favourite` ->
+  `rest/experimental/relation/user/current/favourite/toContent/{id}`
+  (best-effort: experimental relations API, may 404/405 on some flavours).
+
 ## Body format rules (the important part)
 `body_html`/`description_html` is the editor's HTML subset:
 `p br hr h1-h6 strong b em i u s del code pre ul ol li a[href] blockquote

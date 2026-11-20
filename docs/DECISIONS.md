@@ -98,3 +98,35 @@
   No online renderer, no new deps.
 - **Versions view reuses JQL counts** — one `fixVersion =` count query per
   version, parallelized, cached 120s. Capped at 25 versions.
+
+## v0.5.0 — parity sweep
+
+- **Issue history rides the detail fetch.** `expand=changelog` on the same
+  `issue()` call returns up to 50 histories — zero extra upstream latency.
+  Items normalize `fromString/toString` (falling back to raw `from/to` ids).
+- **Custom-field editing is scalar-only by construction.** `_issue_attrs`
+  marks `editable` only when the raw value is str/int/float/bool; the PUT
+  path rejects non-scalars 400. Option objects, user pickers, cascading
+  selects and multi-value fields stay read-only — their payload shapes are
+  too instance-specific to guess safely.
+- **Bulk edit is sequential per-key PUTs**, not `PUT /issue/bulk` — bulk
+  update can't express per-issue `update` label ops cleanly and N≤50 keeps
+  it simple; failures are collected per key instead of aborting.
+- **Labels add/remove use Jira `update` operations** (`{add}/{remove}`)
+  rather than rewriting the whole label set — additive edits can't clobber
+  concurrent label changes.
+- **Sprint report is a stats panel, not a chart.** The agile report
+  endpoint's contents are normalized defensively (issueCount dict, issues
+  list, or bare int) since payload shape varies by Jira version.
+- **Conf watch uses the documented v1 endpoint** (`user/watch/content/{id}`,
+  GET status + POST/DELETE toggle; the lib's default `X-Atlassian-Token:
+  no-check` header satisfies its XSRF requirement).
+- **Conf favourite uses the experimental relations API**
+  (`rest/experimental/relation/user/current/favourite/toContent/{id}`) —
+  the only REST toggle that exists; read state comes free from
+  `metadata.currentuser.favourited` expand. Best-effort: if the instance
+  doesn't expose it, the UI toasts rather than pretending.
+- **Mentions are cosmetic, not semantic.** `@name` text nodes get wrapped
+  in `<span class="mention">` post-render (text-node walk only — sanitized
+  HTML is never reparsed). The comment box gets a user datalist backed by
+  `/api/jira/users`; there's no real mention resolution or notification.

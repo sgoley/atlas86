@@ -65,3 +65,22 @@ New reads added this tranche and their cache TTLs: `/api/home` 60s,
 `/api/jira/project/<k>/versions` 120s, conf page comments 60s. All warm
 reads stay sub-millisecond; cold reads cost one upstream round-trip because
 every multi-call endpoint fans out on a thread pool.
+
+## v0.5.0 re-run (same harness)
+
+| route                | cold ms | warm ms |
+| -------------------- | ------- | ------- |
+| home dashboard       |    55.7 |     0.3 |
+| jira issues list     |    51.0 |     0.2 |
+| jira issue detail    |    55.0 |     0.1 |  (changelog rides the same issue call, +0 upstream)
+| jira sprint report   |    50.8 |     0.1 |
+| jira projects        |    50.8 |     0.1 |
+| conf pages           |    53.3 |     0.1 |
+| conf page            |    55.7 |     0.1 |  (+ watch-status call, still one round-trip)
+| conf spaces          |    53.3 |     0.1 |
+
+Issue history (`expand=changelog`) adds zero upstream calls — it piggybacks
+on the existing `issue()` fetch. Sprint report is a single agile GET.
+Conf page detail gained a `user/watch/content` status check, still parallel
+with the other five fetches. Bulk edit is N sequential PUTs by design (≤50
+keys, write path, cache cleared anyway).

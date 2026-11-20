@@ -35,6 +35,11 @@ class FakeJira:
         slowify(self, ["projects", "jql", "issue", "get", "get_issue_transitions"])
 
     def get(self, path, **kw):
+        if "/report" in path:
+            return {"contents": {"issuesCompletedInSprint": {"issueCount": 4},
+                                 "issuesNotCompletedInSprint": {"issueCount": 2}},
+                    "sprintMeta": {"name": "S1", "state": "closed"},
+                    "velocityStats": {"estimated": 6, "complete": 4, "avg": 5}}
         return {}
 
     def projects(self):
@@ -56,6 +61,9 @@ class FakeJira:
 
     def get_issue_transitions(self, key):
         return [{"id": "1", "name": "Done"}]
+
+    def get_agile_resource_url(self, path):
+        return "rest/agile/1.0/" + path
 
 
 class FakeConf:
@@ -110,6 +118,7 @@ def main():
         ("home dashboard", "/api/home"),
         ("jira issues list", "/api/jira/issues?jql=project%3DT&limit=50"),
         ("jira issue detail", "/api/jira/issue/T-1"),
+        ("jira sprint report", "/api/jira/sprints/7/report"),
         ("jira projects", "/api/jira/projects"),
         ("conf pages", "/api/confluence/pages?space=DOC&limit=50"),
         ("conf page", "/api/confluence/page/1"),
