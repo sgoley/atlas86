@@ -112,6 +112,45 @@ def _field_text(v, depth=0):
     return str(v)[:240]
 
 
+def _diagram_previews(storage_html, attachments):
+    """Best-effort: find image attachments referenced by diagram macros in
+    storage format and pair them with their download URLs. Drawio/gliffy
+    source files get a same-basename image sibling when one exists."""
+    if not storage_html or not attachments:
+        return []
+    wanted = set()
+    # filenames referenced inside diagram macro blocks
+    for m in re.finditer(
+            r'<ac:structured-macro[^>]*ac:name="(?:drawio|gliffy|diagram|plantuml[^"]*)"[^>]*>(.*?)</ac:structured-macro>',
+            storage_html, re.I | re.S):
+        wanted.update(re.findall(r'ri:filename="([^"]+)"', m.group(1)))
+    # also catch self-closing/loose attachment refs on drawio pages
+    if not wanted and re.search(r'drawio|gliffy', storage_html, re.I):
+        wanted.update(re.findall(r'ri:filename="([^"]+)"', storage_html))
+    by_name = {a["filename"]: a for a in attachments if a.get("filename")}
+    stem = lambda n: re.sub(r'\.(drawio|gliffy|xml|png|svg|jpe?g)$', '', n, flags=re.I)
+    out, seen = [], set()
+    for name in wanted:
+        a = by_name.get(name)
+        if not a:
+            # diagram source -> look for rendered sibling image
+            base = stem(name)
+            for ext in (".png", ".svg", ".jpg", ".jpeg"):
+                cand = by_name.get(base + ext)
+                if cand:
+                    a = cand
+                    break
+        if not a or not a.get("url") or name in seen:
+            continue
+        seen.add(name)
+        mime = a.get("mime") or ""
+        out.append({"name": name, "url": a["url"],
+                    "image": mime.startswith("image/") or
+                    (a.get("filename") or "").lower().endswith(
+                        (".png", ".svg", ".jpg", ".jpeg"))})
+    return out[:20]
+
+
 _FIELD_LABELS = {"duedate": "Due Date", "fixVersions": "Fix Versions",
                  "components": "Components", "priority": "Priority",
                  "labels": "Labels", "environment": "Environment"}
@@ -322,9 +361,10 @@ def create_app():
 
     def _issue_detail(key):
         c = holder["client"]
-        issue, trans = _parallel([
+        issue, trans, remotes = _parallel([
             lambda: c.jira.issue(key, fields="*all", expand="renderedFields") or {},
             lambda: c.jira.get_issue_transitions(key) or [],
+            lambda: c.jira.get(f"rest/api/{_ver(c)}/issue/{key}/remotelink") or [],
         ])
         f = issue.get("fields") or {}
         rf = issue.get("renderedFields") or {}
@@ -387,6 +427,10 @@ def create_app():
             "watches": f.get("watches"),
             "votes": f.get("votes"),
             "timetracking": f.get("timetracking"),
+            "remote_links": [{"id": str(r.get("id")),
+                              "title": (r.get("object") or {}).get("title"),
+                              "url": (r.get("object") or {}).get("url")}
+                             for r in remotes if isinstance(r, dict)],
         }
 
     @app.get("/api/jira/issue/<key>")
@@ -439,6 +483,8 @@ def create_app():
         b = body()
         fields = {"project": {"key": b["project"]}, "summary": b["summary"],
                   "issuetype": {"name": b["issuetype"]}}
+        if b.get("parent"):
+            fields["parent"] = {"key": b["parent"]}
         fields.update(_jira_write_fields(b))
         c = holder["client"]
         if holder["cfg"]["cloud"]:
@@ -692,7 +738,175 @@ def create_app():
                 "priority": (f.get("priority") or {}).get("name"),
                 "points": _sprint_points(holder["client"], f),
                 "epic": _epic_key(holder["client"], f),
+                "sprint": _sprint_name(f),
                 "updated": f.get("updated")}
+
+    def _sprint_name(fields):
+        # agile backlog/sprint payloads carry sprint info in customfield_* strings
+        for fid, val in fields.items():
+            if isinstance(val, str) and "Sprint@" in val[:60]:
+                m = re.search(r"name=([^,\]]+)", val)
+                if m:
+                    return m.group(1)
+            if isinstance(val, list):
+                for v in val:
+                    if isinstance(v, str) and "Sprint@" in v[:60]:
+                        m = re.search(r"name=([^,\]]+)", v)
+                        if m:
+                            return m.group(1)
+        return None
+
+    @app.get("/api/jira/boards/<bid>/backlog")
+    @api
+    def jira_backlog(bid):
+        c = holder["client"].jira
+        data = c.get_issues_for_backlog(bid) or {}
+        return cache_wrap(f"jira:backlog:{bid}", 30, lambda: [
+            _sprint_card(i) for i in data.get("issues", [])])
+
+    @app.get("/api/jira/boards/<bid>/configuration")
+    @api
+    def jira_board_config(bid):
+        def fetch():
+            cfg = holder["client"].jira.get_agile_board_configuration(bid) or {}
+            cols = []
+            for col in ((cfg.get("columnConfig") or {}).get("columns") or []):
+                cols.append({
+                    "name": col.get("name"),
+                    "statuses": [{"id": s.get("id"), "name": s.get("name")}
+                                 for s in col.get("statuses") or []],
+                })
+            return {"id": cfg.get("id"), "name": cfg.get("name"),
+                    "columns": cols}
+        return cache_wrap(f"jira:boardcfg:{bid}", 300, fetch)
+
+    @app.post("/api/jira/sprints/<sid>/issues")
+    @api
+    def jira_sprint_add(sid):
+        keys = (body().get("keys") or [])[:50]
+        if not keys:
+            return jsonify(error="keys required"), 400
+        holder["client"].jira.add_issues_to_sprint(sid, keys)
+        invalidate()
+        return {"ok": True}
+
+    @app.post("/api/jira/backlog/issues")
+    @api
+    def jira_backlog_move():
+        keys = (body().get("keys") or [])[:50]
+        if not keys:
+            return jsonify(error="keys required"), 400
+        holder["client"].jira.move_issues_to_backlog(keys)
+        invalidate()
+        return {"ok": True}
+
+    def _rank_fid():
+        try:
+            for fid, name in holder["client"].field_names().items():
+                if (name or "").lower() == "rank":
+                    return fid
+        except Exception:
+            pass
+        return None
+
+    @app.post("/api/jira/issues/rank")
+    @api
+    def jira_rank():
+        b = body()
+        keys = b.get("keys") or []
+        before = b.get("before")
+        fid = _rank_fid()
+        if not keys or not before or not fid:
+            return jsonify(error="keys, before and a Rank field are required"), 400
+        holder["client"].jira.update_rank(keys[:50], before, fid)
+        invalidate()
+        return {"ok": True}
+
+    @app.post("/api/jira/sprints")
+    @api
+    def jira_sprint_create():
+        b = body()
+        res = holder["client"].jira.create_sprint(
+            b["name"], b["board_id"],
+            start_date=b.get("startDate"), end_date=b.get("endDate"),
+            goal=b.get("goal")) or {}
+        invalidate()
+        return {"id": res.get("id")}
+
+    @app.post("/api/jira/sprints/<sid>/state")
+    @api
+    def jira_sprint_state(sid):
+        state = (body().get("state") or "").lower()
+        if state not in ("active", "closed"):
+            return jsonify(error="state must be active|closed"), 400
+        holder["client"].jira.update_partially_sprint(sid, {"state": state})
+        invalidate()
+        return {"ok": True}
+
+    # ---------- worklog / remote links ----------
+
+    @app.get("/api/jira/issue/<key>/worklog")
+    @api
+    def jira_worklog(key):
+        ver = _ver(holder["client"])
+        data = holder["client"].jira.get(
+            f"rest/api/{ver}/issue/{key}/worklog?maxResults=50") or {}
+        out = []
+        for w in data.get("worklogs", []):
+            c = w.get("comment")
+            if isinstance(c, dict):
+                c = adf_to_text(c) or ""
+            out.append({"id": str(w.get("id")), "author": _display(w.get("author")),
+                        "timeSpent": w.get("timeSpent"),
+                        "started": w.get("started"), "comment": c})
+        return {"worklogs": out}
+
+    @app.post("/api/jira/issue/<key>/worklog")
+    @api
+    def jira_worklog_add(key):
+        b = body()
+        spent = (b.get("timeSpent") or "").strip()
+        if not spent:
+            return jsonify(error="timeSpent required (e.g. 1h 30m)"), 400
+        ver = _ver(holder["client"])
+        data = {"timeSpent": spent}
+        if b.get("started"):
+            data["started"] = b["started"]
+        comment = (b.get("comment") or "").strip()
+        if comment:
+            if holder["cfg"]["cloud"]:
+                data["comment"] = {"type": "doc", "version": 1, "content": [
+                    {"type": "paragraph",
+                     "content": [{"type": "text", "text": comment}]}]}
+            else:
+                data["comment"] = comment
+        holder["client"].jira.post(
+            f"rest/api/{ver}/issue/{key}/worklog", data=data)
+        invalidate()
+        return {"ok": True}
+
+    @app.post("/api/jira/issue/<key>/remlink")
+    @api
+    def jira_remlink_add(key):
+        b = body()
+        url, title = (b.get("url") or "").strip(), (b.get("title") or "").strip()
+        if not url:
+            return jsonify(error="url required"), 400
+        ver = _ver(holder["client"])
+        holder["client"].jira.post(
+            f"rest/api/{ver}/issue/{key}/remotelink",
+            data={"object": {"url": url, "title": title or url}})
+        invalidate()
+        return {"ok": True}
+
+    @app.delete("/api/jira/issue/<key>/remlink/<rid>")
+    @api
+    def jira_remlink_del(key, rid):
+        ver = _ver(holder["client"])
+        holder["client"].jira.delete(
+            f"rest/api/{ver}/issue/{key}/remotelink/{rid}")
+        invalidate()
+        return {"ok": True}
 
     # ---------- Confluence ----------
 
@@ -756,7 +970,7 @@ def create_app():
 
         def _page():
             return c.get_page_by_id(
-                page_id, expand="body.view,version,space") or {}
+                page_id, expand="body.view,body.storage,version,space") or {}
 
         def _anc():
             try:
@@ -802,6 +1016,8 @@ def create_app():
         p, ancestors, children, labels, atts = _parallel(
             [_page, _anc, _kids, _labs, _atts])
         space = p.get("space") or {}
+        diagrams = _diagram_previews(
+            ((p.get("body") or {}).get("storage") or {}).get("value") or "", atts)
         return {
             "id": str(p.get("id")),
             "title": p.get("title"),
@@ -813,6 +1029,7 @@ def create_app():
             "children": children,
             "labels": labels,
             "attachments": atts,
+            "diagrams": diagrams,
         }
 
     @app.get("/api/confluence/page/<page_id>")
@@ -830,6 +1047,71 @@ def create_app():
             {"number": v.get("number"), "when": v.get("when"),
              "by": _display(v.get("by")), "message": v.get("message")}
             for v in data.get("results", [])])
+
+    @app.get("/api/confluence/page/<page_id>/restrictions")
+    @api
+    def conf_page_restrictions(page_id):
+        def fetch():
+            data = holder["client"].conf.get(
+                f"rest/api/content/{page_id}/restriction") or {}
+            read = (((data.get("restrictions") or {}).get("read") or {})
+                    .get("results") or [])
+            return [{"type": ((r.get("operation") or {}).get("target") or {})
+                     .get("type"),
+                     "name": ((r.get("operation") or {}).get("target") or {})
+                             .get("displayName")
+                             or ((r.get("operation") or {}).get("target") or {})
+                             .get("id")}
+                    for r in read]
+        return cache_wrap(f"conf:restr:{page_id}", 120, fetch)
+
+    @app.post("/api/confluence/page/<page_id>/label")
+    @api
+    def conf_label_add(page_id):
+        name = (body().get("name") or "").strip()
+        if not name:
+            return jsonify(error="name required"), 400
+        holder["client"].conf.set_page_label(page_id, name)
+        invalidate()
+        return {"ok": True}
+
+    @app.delete("/api/confluence/page/<page_id>/label")
+    @api
+    def conf_label_del(page_id):
+        name = request.args.get("name") or ""
+        if not name:
+            return jsonify(error="name required"), 400
+        holder["client"].conf.remove_page_label(page_id, name)
+        invalidate()
+        return {"ok": True}
+
+    @app.put("/api/confluence/page/<page_id>/move")
+    @api
+    def conf_page_move(page_id):
+        b = body()
+        holder["client"].conf.move_page(
+            b["space"], page_id, target_id=b.get("parent_id") or None,
+            position="append")
+        invalidate()
+        return {"ok": True}
+
+    @app.post("/api/confluence/page/<page_id>/copy")
+    @api
+    def conf_page_copy(page_id):
+        c = holder["client"].conf
+        p = c.get_page_by_id(
+            page_id, expand="body.storage,ancestors,version") or {}
+        storage = ((p.get("body") or {}).get("storage") or {}).get("value") or ""
+        b = body()
+        title = (b.get("title") or "").strip() or (p.get("title") or "") + " (copy)"
+        space = b.get("space") or (p.get("space") or {}).get("key")
+        ancestors = p.get("ancestors") or []
+        parent = b.get("parent_id") or (str(ancestors[-1]["id"])
+                                      if ancestors else None)
+        res = c.create_page(space, title, storage, parent_id=parent,
+                            representation="storage") or {}
+        invalidate()
+        return {"id": str(res.get("id"))}
 
     @app.get("/api/confluence/attachment")
     @api
