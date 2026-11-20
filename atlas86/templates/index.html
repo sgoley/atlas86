@@ -21,7 +21,8 @@
     <span class="cursor-block"></span>
   </div>
   <nav id="tabs">
-    <button class="tab active" data-tab="jira">[1] JIRA</button>
+    <button class="tab active" data-tab="home">[0] HOME</button>
+    <button class="tab" data-tab="jira">[1] JIRA</button>
     <button class="tab" data-tab="conf">[2] CONFLUENCE</button>
     <button class="tab" data-tab="setup">[3] SETUP</button>
   </nav>
@@ -42,7 +43,7 @@
   </section>
 </main>
 
-<footer id="statusbar"><span id="status-msg">BOOTING...</span><span id="status-keys">1-3 TABS · / SEARCH · J/K NAV · ENTER OPEN · E EDIT · N NEW · D DELETE · [/] BOARD MOVE · R RELOAD · CTRL-S SAVE · ? HELP</span></footer>
+<footer id="statusbar"><span id="status-msg">BOOTING...</span><span id="status-keys">0-3 TABS · / SEARCH · J/K NAV · ENTER OPEN · E EDIT · N NEW · D DELETE · [/] BOARD MOVE · R RELOAD · CTRL-S SAVE · ? HELP</span></footer>
 
 <div id="toasts"></div>
 
@@ -90,7 +91,7 @@
 <div id="help-overlay" class="overlay" hidden>
   <div class="panel narrow">
     <div class="panel-title">[ KEYBINDINGS ]</div>
-    <pre class="help-grid">1 / 2 / 3        SWITCH TAB (JIRA / CONFLUENCE / SETUP)
+    <pre class="help-grid">0 / 1 / 2 / 3  SWITCH TAB (HOME / JIRA / CONFLUENCE / SETUP)
 /              FOCUS SEARCH / JQL BOX
 J / K          MOVE LIST CURSOR
 ENTER          OPEN SELECTED ITEM

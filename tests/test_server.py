@@ -22,6 +22,7 @@ class FakeJira:
             "key": "T-1",
             "fields": {
                 "summary": "s", "updated": "2026-01-01",
+                "duedate": "2026-02-01",
                 "status": {"name": "Open"},
                 "issuetype": {"name": "Bug"},
                 "assignee": {"displayName": "Ann"},
@@ -58,6 +59,14 @@ class FakeJira:
 
     def get(self, path, **kw):
         self.calls.append(("GET", path, kw))
+        if "/transitions" in path:
+            return {"transitions": [
+                {"id": "31", "name": "Done", "to": {"name": "Done"},
+                 "fields": {"resolution": {
+                     "name": "Resolution", "required": True,
+                     "allowedValues": [{"id": "1", "name": "Done"},
+                                       {"id": "2", "name": "Won't Do"}]}}},
+                {"id": "32", "name": "Start", "to": {"name": "In Progress"}}]}
         if "editmeta" in path:
             return {"fields": {"priority": {"name": "Priority", "required": False,
                                             "allowedValues": [{"name": "High"},
@@ -170,6 +179,15 @@ class FakeJira:
         self.calls.append(("sprint_create", name, board_id))
         return {"id": 9}
 
+    def get_agile_resource_url(self, path):
+        return "rest/agile/1.0/" + path
+
+    def get_project_versions(self, key):
+        return [{"name": "v1.0", "released": True, "releaseDate": "2026-01-01",
+                 "archived": False, "startDate": "2025-12-01",
+                 "dueDate": "2026-01-15"},
+                {"name": "v1.1", "released": False, "archived": False}]
+
     def update_partially_sprint(self, sid, data):
         self.calls.append(("sprint_state", sid, data))
         return {}
@@ -236,6 +254,16 @@ class FakeConf:
         self.calls.append(("GET", path, kw))
         if path.startswith("/download/"):
             return b"%PDF-fake"
+        if "child/comment" in path:
+            return {"results": [
+                {"id": "501", "version": {"number": 1, "when": "2026-01-04",
+                                          "by": {"displayName": "Bo"}},
+                 "body": {"view": {"value": "<p>nice page</p>"}},
+                 "ancestors": [{"id": "42"}]},
+                {"id": "502", "version": {"number": 1, "when": "2026-01-05",
+                                          "by": {"displayName": "Cy"}},
+                 "body": {"view": {"value": "<p>reply</p>"}},
+                 "ancestors": [{"id": "42"}, {"id": "501"}]}]}
         if "version" in path:
             return {"results": [{"number": 3, "when": "2026-01-02T00:00:00Z",
                                  "by": {"displayName": "Ann"}, "message": "edit"}]}
@@ -262,6 +290,14 @@ class FakeConf:
 
     def attach_content(self, content, name, **kw):
         self.calls.append(("attach", name, content))
+        return {}
+
+    def post(self, path, data=None, **kw):
+        self.calls.append(("POST", path, data))
+        return {}
+
+    def delete(self, path, **kw):
+        self.calls.append(("DELETE", path))
         return {}
 
 
@@ -623,3 +659,133 @@ def test_confluence_labels_move_copy_restrictions_diagrams(client):
     assert d["diagrams"][0]["name"] == "arch.drawio"
     assert d["diagrams"][0]["image"] is True
     assert "arch.png" in d["diagrams"][0]["url"]
+
+
+def test_jira_worklog_edit_delete(client):
+    _configured(client)
+    r = client.put("/api/jira/issue/T-1/worklog/1",
+                   json={"timeSpent": "2h", "comment": "edited"})
+    assert r.get_json() == {"ok": True}
+    r = client.delete("/api/jira/issue/T-1/worklog/1")
+    assert r.get_json() == {"ok": True}
+    calls = FakeAtlas.instances[-1].jira.calls
+    put = [c for c in calls if c[0] == "PUT" and "/worklog/1" in str(c[1])]
+    assert put and put[-1][2]["timeSpent"] == "2h"
+    assert put[-1][2]["comment"] == "edited"  # server/DC: plain text
+    assert any(c[0] == "DELETE" and "/worklog/1" in str(c[1]) for c in calls)
+
+    # cloud -> ADF comment on update
+    client.post("/api/config", json={"url": "https://x", "user": "u",
+                                      "cloud": True, "token": "t"})
+    client.put("/api/jira/issue/T-1/worklog/1", json={"comment": "note"})
+    puts = [c for c in FakeAtlas.instances[-1].jira.calls
+            if c[0] == "PUT" and "/worklog/1" in str(c[1])]
+    assert puts[-1][2]["comment"]["type"] == "doc"
+
+
+def test_jira_rank_after(client):
+    _configured(client)
+    r = client.post("/api/jira/issues/rank",
+                    json={"keys": ["T-2"], "after": "T-1"})
+    assert r.get_json() == {"ok": True}
+    puts = [c for c in FakeAtlas.instances[-1].jira.calls
+            if c[0] == "PUT" and "rank" in str(c[1])]
+    assert puts, "raw agile rank PUT not called"
+    data = puts[-1][2]
+    assert data["issues"] == ["T-2"]
+    assert data["rankAfterIssue"] == "T-1"
+    assert data["rankCustomFieldId"] == "customfield_10030"
+
+
+def test_transition_screen_fields(client):
+    _configured(client)
+    d = client.get("/api/jira/issue/T-1").get_json()
+    t = d["transitions"][0]
+    assert t["id"] == "31"
+    meta = t["fields"]["resolution"]
+    assert meta["required"] is True and meta["name"] == "Resolution"
+    assert meta["allowedValues"][0] == {"id": "1", "value": "Done"}
+    assert d["transitions"][1].get("fields") is None
+
+    r = client.put("/api/jira/issue/T-1", json={
+        "transition_id": "31",
+        "transition_fields": {"resolution": {"id": "1", "name": "Done"},
+                              "comment": "<p>shipping it</p>"}})
+    assert r.get_json() == {"ok": True}
+    posts = [c for c in FakeAtlas.instances[-1].jira.calls
+             if c[0] == "POST" and "transitions" in str(c[1])]
+    assert posts, "transition POST not called"
+    payload = posts[-1][2]
+    assert payload["transition"] == {"id": "31"}
+    assert payload["fields"]["resolution"] == {"id": "1", "name": "Done"}
+    # server/DC -> comment converted to wiki string, not left as html
+    assert "shipping it" in payload["fields"]["comment"]
+    assert not isinstance(payload["fields"]["comment"], dict)
+
+
+def test_jira_versions_and_home(client):
+    _configured(client)
+    vs = client.get("/api/jira/project/T/versions").get_json()
+    assert len(vs) == 2
+    assert vs[0]["name"] == "v1.0" and vs[0]["released"] is True
+    assert vs[0]["releaseDate"] == "2026-01-01"
+    assert vs[0]["issues"] == 1  # fake jql returns one issue, no total
+    assert vs[1]["released"] is False
+
+    h = client.get("/api/home").get_json()
+    assert set(h) == {"mine", "due", "watched", "sprint"}
+    assert h["mine"][0]["key"] == "T-1"
+    assert h["mine"][0]["duedate"] == "2026-02-01"
+
+
+def test_confluence_comments(client):
+    _configured(client)
+    cs = client.get("/api/confluence/page/42/comments").get_json()
+    assert len(cs) == 2
+    assert cs[0]["author"] == "Bo" and cs[0]["parent"] is None
+    assert cs[0]["body_html"] == "<p>nice page</p>"
+    assert cs[1]["parent"] == "501"  # reply detected via ancestors
+
+    r = client.post("/api/confluence/page/42/comment",
+                    json={"body_html": "<p>hello</p>"})
+    assert r.get_json() == {"ok": True}
+    r = client.post("/api/confluence/page/42/comment",
+                    json={"body_html": "<p>reply</p>", "parent_id": "501"})
+    assert r.get_json() == {"ok": True}
+    r = client.delete("/api/confluence/comment/501")
+    assert r.get_json() == {"ok": True}
+    assert client.post("/api/confluence/page/42/comment",
+                       json={"body_html": "   "}).status_code == 400
+
+    calls = FakeAtlas.instances[-1].conf.calls
+    posts = [c for c in calls if c[0] == "POST" and "rest/api/content" in str(c[1])]
+    assert posts[0][2]["type"] == "comment"
+    assert posts[0][2]["body"]["storage"]["representation"] == "storage"
+    assert posts[0][2]["ancestors"] == [{"id": 42}]
+    assert posts[1][2]["ancestors"] == [{"id": 42}, {"id": 501}]
+    assert any(c[0] == "DELETE" and "rest/api/content/501" in str(c[1])
+               for c in calls)
+
+
+def test_drawio_svg_extraction():
+    from atlas86.server import _drawio_svg
+    mx = ('<mxGraphModel><root>'
+          '<mxCell id="1" vertex="1" value="Start">'
+          '<mxGeometry x="0" y="0" width="80" height="40"/></mxCell>'
+          '<mxCell id="2" vertex="1" value="End &amp; Done">'
+          '<mxGeometry x="200" y="0" width="80" height="40"/></mxCell>'
+          '<mxCell id="3" edge="1" source="1" target="2"/>'
+          '</root></mxGraphModel>')
+    # inline xml payload
+    svg = _drawio_svg(('<mxfile><diagram name="d1">' + mx +
+                       '</diagram></mxfile>').encode())
+    assert svg and svg.startswith("<svg")
+    assert "Start" in svg and "End &amp; Done" in svg
+    # base64+zlib compressed payload (real drawio format)
+    import base64, zlib
+    comp = base64.b64encode(zlib.compress(mx.encode())).decode()
+    svg2 = _drawio_svg(('<mxfile><diagram>' + comp + '</diagram></mxfile>').encode())
+    assert svg2 and "Start" in svg2
+    # graceful fallback
+    assert _drawio_svg(b"not a drawio file") is None
+    assert _drawio_svg(b"") is None

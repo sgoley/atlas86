@@ -48,3 +48,20 @@ Same harness, same latency:
 - Issue detail fetches epic children via one extra JQL only for Epics.
 - j/k list navigation prefetches the selected item's detail (bare fetch, no
   toast) so ENTER opens from the warm cache.
+
+## v0.4.0 re-run (same harness, fake updated for raw-REST detail fan-out)
+
+| route                | cold ms | warm ms |
+| -------------------- | ------- | ------- |
+| home dashboard       |    56.0 |     0.6 |  (4 parallel JQL buckets, one round-trip)
+| jira issues list     |    53.7 |     0.4 |
+| jira issue detail    |    53.1 |     0.3 |  (issue+transitions+remotelink parallel)
+| jira projects        |    55.2 |     0.3 |
+| conf pages           |    53.7 |     0.4 |
+| conf page            |    52.4 |     0.4 |  (+ diagram-source fetches, capped at 3)
+| conf spaces          |    52.5 |     0.3 |
+
+New reads added this tranche and their cache TTLs: `/api/home` 60s,
+`/api/jira/project/<k>/versions` 120s, conf page comments 60s. All warm
+reads stay sub-millisecond; cold reads cost one upstream round-trip because
+every multi-call endpoint fans out on a thread pool.

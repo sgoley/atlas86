@@ -32,7 +32,10 @@ def slowify(obj, names):
 
 class FakeJira:
     def __init__(self, cfg):
-        slowify(self, ["projects", "jql", "issue", "get_issue_transitions"])
+        slowify(self, ["projects", "jql", "issue", "get", "get_issue_transitions"])
+
+    def get(self, path, **kw):
+        return {}
 
     def projects(self):
         return [{"key": "T", "name": "Test"}]
@@ -58,7 +61,7 @@ class FakeJira:
 class FakeConf:
     def __init__(self):
         slowify(self, ["get_all_spaces", "get_all_pages_from_space",
-                       "cql", "get_page_by_id"])
+                       "cql", "get_page_by_id", "get"])
 
     def get_all_spaces(self, **kw):
         return {"results": [{"key": "DOC", "name": "Docs"}]}
@@ -75,6 +78,9 @@ class FakeConf:
                 "space": {"key": "DOC", "name": "Docs"},
                 "version": {"number": 3},
                 "body": {"view": {"value": "<p>body</p>"}}}
+
+    def get(self, path, **kw):
+        return {}
 
 
 class FakeAtlas:
@@ -101,6 +107,7 @@ def main():
                                 "cloud": False, "token": "t"})
 
     routes = [
+        ("home dashboard", "/api/home"),
         ("jira issues list", "/api/jira/issues?jql=project%3DT&limit=50"),
         ("jira issue detail", "/api/jira/issue/T-1"),
         ("jira projects", "/api/jira/projects"),

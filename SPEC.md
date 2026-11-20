@@ -102,11 +102,12 @@ mutation clears the cache.
 - `GET  /api/jira/boards/<id>/configuration` -> `{columns:[{name,statuses:[{id,name}]}]}`
 - `POST /api/jira/sprints/<id>/issues` `{keys:[]}` -> add to sprint
 - `POST /api/jira/backlog/issues` `{keys:[]}` -> move to backlog
-- `POST /api/jira/issues/rank` `{keys:[], before}` -> rank before issue
+- `POST /api/jira/issues/rank` `{keys:[], before|after}` -> rank before/after issue
 - `POST /api/jira/sprints` `{name,board_id,startDate?,endDate?,goal?}`
 - `POST /api/jira/sprints/<id>/state` `{state:active|closed}`
 - `GET  /api/jira/issue/<key>/worklog` -> `{worklogs:[{id,author,timeSpent,started,comment}]}`
 - `POST /api/jira/issue/<key>/worklog` `{timeSpent,started?,comment?}`
+- `PUT|DELETE /api/jira/issue/<key>/worklog/<wid>` `{timeSpent?,started?,comment?}`
 - `POST /api/jira/issue/<key>/remlink` `{url,title?}`; `DELETE .../remlink/<id>`
 - `POST /api/jira/issue` accepts optional `parent` (subtask creation)
 - `GET  /api/confluence/page/<id>/restrictions` -> `[{type,name}]` read restrictions
@@ -120,6 +121,34 @@ mutation clears the cache.
 - `GET  /api/confluence/attachment?dl=<_links.download path>` -> proxied bytes;
   path must start `/download/` (400 otherwise). Images served inline.
 - `POST /api/confluence/page/<id>/attachment` (multipart `file`)
+
+## v0.4 API extensions (final tranche; same error/JSON rules)
+
+- `GET  /api/home` -> `{mine, due, watched, sprint}` — four parallel JQL
+  buckets (assignee=me unresolved by updated; duedate this Mon–Sun;
+  watcher=me unresolved; sprint in openSprints), each up to 8 issue briefs.
+  Cached 60s. Briefs now also carry `duedate`.
+- `GET  /api/jira/issue/<key>` transitions are fetched with
+  `?expand=transitions.fields` and each entry is
+  `{id, name, to, fields}` where `fields` = `{fieldId: {name, required,
+  allowedValues:[{id,value}]}}` or null.
+- `PUT  /api/jira/issue/<key>` accepts `transition_fields` = `{fieldId: value}`
+  sent alongside `transition_id` to `POST /issue/{key}/transitions`. A
+  `comment` field value is treated as sanitized HTML and converted to ADF
+  (cloud) or wiki (server); other values pass through.
+- `GET  /api/jira/project/<key>/versions` -> up to 25
+  `{name, released, releaseDate, archived, startDate, dueDate, issues}` —
+  `issues` is a `fixVersion =` JQL count (null on failure). Cached 120s.
+- `GET  /api/confluence/page/<id>/comments` -> `[{id, author, when,
+  body_html, parent}]` — `parent` is the parent comment id for replies
+  (detected via ancestors), else null. Cached 60s.
+- `POST /api/confluence/page/<id>/comment` `{body_html, parent_id?}` —
+  storage-format body (sanitized HTML subset), ancestors = page (+ parent
+  comment for replies).
+- `DELETE /api/confluence/comment/<cid>` -> `{ok:true}`
+- `GET  /api/confluence/page/<id>` `diagrams[]` entries may carry `svg` —
+  a self-contained phosphor-styled SVG extracted from `.drawio` XML
+  (mxGraphModel, inline or base64+zlib compressed; capped 120 cells).
 
 ## Body format rules (the important part)
 `body_html`/`description_html` is the editor's HTML subset:

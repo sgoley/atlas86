@@ -64,7 +64,7 @@ back to the browser or logged.
 
 | Key        | Action                          |
 | ---------- | ------------------------------- |
-| `1` `2` `3`| Switch tabs (Jira / Confluence / Setup) |
+| `0` `1` `2` `3` | Switch tabs (Home / Jira / Confluence / Setup) |
 | `/`        | Focus search / JQL box          |
 | `j` `k`    | Move through the list           |
 | `enter`    | Open selected item              |
@@ -81,18 +81,27 @@ The mouse works too. We're not monsters.
 
 ## What it does
 
+- **HOME** (`0`): your-work dashboard — my open issues, due this week,
+  watched issues, active sprint items. Click a key to jump into Jira.
 - **Jira**: JQL search with presets + saved filters, full issue detail (every
   field, rendered generically), edit summary/description, edit priority /
-  assignee / labels / due date / components / fix versions, transitions,
-  comments, issue links, watchers, votes, attachments (view inline + upload),
-  epic/parent/child hierarchy.
-- **Boards**: pick project → board → sprint, cards grouped by status;
-  `[`/`]` moves a card to the adjacent column via the matching transition.
+  assignee / labels / due date / components / fix versions, transitions
+  (including transition-screen fields like Resolution), comments, issue links,
+  remote links, watchers, votes, worklog (view/log/edit/delete), attachments
+  (view inline + upload), epic/parent/child/subtask hierarchy.
+- **Boards**: pick project → board → sprint, cards grouped by configured
+  status columns (or epic swimlanes), drag-and-drop or `[`/`]` moves via the
+  matching transition, sprint create/start/complete, backlog view with
+  sprint sections, checkbox bulk moves, and drag-to-position ranking.
+- **Versions**: per-project fixVersions with issue counts and release state,
+  from the board header.
 - **Confluence**: space browse + title search + raw CQL, page tree
-  (ancestors/children), labels, version history, attachments (inline images +
-  upload), WYSIWYG edit.
+  (ancestors/children), labels, page comments (threads, replies, delete),
+  version history, move/copy/restrictions, attachments (inline images +
+  upload), diagram previews (images, drawio→SVG extraction, links),
+  WYSIWYG edit.
 - **Fast**: TTL-cached reads (~0.3ms warm vs ~50ms+ cold upstream),
-  virtualized lists. See `docs/PERF.md`.
+  virtualized lists, parallel detail fetches. See `docs/PERF.md`.
 
 ## Known limits
 
@@ -111,14 +120,23 @@ The mouse works too. We're not monsters.
   read-only — their write payloads are too instance-specific to guess.
 - **Board columns follow the board's configured layout** when the agile
   configuration endpoint answers; cards move by workflow transition, so a
-  drop only works when a transition targets a status in that column.
-- **Rank ordering is backlog-only and approximate** — it reuses Jira's rank
-  field via `rankBeforeIssue`; there's no drag-to-position inside a column.
-- **Diagrams are best-effort**: drawio/gliffy/plantuml macros resolve to a
-  same-basename image attachment when one exists; the raw `.drawio` source
-  itself is not rendered (it needs the drawio viewer).
-- **It's a simple client, not a full replacement.** No dashboards, no gadgets,
-  no sprint reports or burndowns. If you need that, go home and use Jira.
+  drop only works when a transition targets a status in that column. If the
+  transition has screen fields (e.g. Resolution), a minimal form is shown.
+- **Rank ordering works within a backlog/sprint section** — drag a row onto
+  another row to insert before it, or onto the section body to send it last.
+  There's no cross-section drag (use the →SPRINT / →BACKLOG buttons).
+- **Diagrams are best-effort**: image attachments render inline; `.drawio`
+  files get a read-only SVG preview extracted from the embedded mxGraphModel
+  (inline or compressed, capped at 120 cells/3 diagrams); anything else
+  falls back to a link. Complex diagrams may render approximately.
+- **Confluence comments are page-level threads** — display, add, reply,
+  delete. Inline/anchored comments (anchored to selected text) are not
+  supported.
+- **HOME is a dashboard-lite**, not Jira's full "Your Work" — four fixed
+  buckets, no gadgets, filters, or activity streams.
+- **It's a simple client, not a full replacement.** No sprint reports,
+  burndowns, roadmaps, or admin screens. If you need that, go home and use
+  Jira.
 
 ## Development
 

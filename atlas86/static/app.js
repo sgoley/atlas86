@@ -104,7 +104,7 @@ async function runBoot() {
       'BOOT ATLAS-86.SYS .....');
     setConn(h.configured);
     state.configured = !!h.configured;
-    setTimeout(() => switchTab(state.configured ? 'jira' : 'setup'), 0);
+    setTimeout(() => switchTab(state.configured ? 'home' : 'setup'), 0);
   } catch (e) {
     lines.push('ATLAS-86 BIOS v0.1', 'MAINFRAME UNREACHABLE', 'CHECK YOUR WIRE, OPERATOR.');
     setConn(false); state.configured = false;
@@ -128,12 +128,14 @@ function setConn(on) {
 /* ============ state ============ */
 const state = {
   configured: false,
-  tab: 'jira',
+  tab: 'home',
+  home: { data: null },
   jira: { jql: 'assignee = currentUser() ORDER BY updated DESC', issues: [], sel: -1,
           detail: null, mode: 'list', view: 'issues', bulk: false, checked: new Set(),
           boards: [], board: null, boardCfg: null, sprints: [], sprint: null,
           columns: [], group: 'status', bsel: { s: -1, i: -1 },
-          backlog: { sections: [], checked: new Set() } },
+          backlog: { sections: [], checked: new Set() },
+          versionsMode: false, versions: null },
   conf: { spaces: [], space: '', pages: [], sel: -1, detail: null, mode: 'list',
           q: '', cql: '', adv: false },
 };
@@ -212,14 +214,18 @@ $('#ed-save').addEventListener('click', () => {
 });
 
 /* ============ tabs ============ */
-const TABS = ['jira', 'conf', 'setup'];
+const TABS = ['home', 'jira', 'conf', 'setup'];
+const TAB_STATUS = { home: 'HOME // YOUR WORK', jira: 'JIRA MODULE LOADED',
+                     conf: 'CONFLUENCE MODULE LOADED', setup: 'SETUP / CONFIGURATION' };
 function switchTab(tab) {
   state.tab = tab;
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  document.body.classList.toggle('setup-mode', tab === 'setup');
-  $('#list-pane').style.display = tab === 'setup' ? 'none' : '';
-  setStatus(tab === 'jira' ? 'JIRA MODULE LOADED' : tab === 'conf' ? 'CONFLUENCE MODULE LOADED' : 'SETUP / CONFIGURATION');
-  if (tab === 'jira') {
+  // setup-mode = full-width single pane (setup form and home dashboard)
+  document.body.classList.toggle('setup-mode', tab === 'setup' || tab === 'home');
+  $('#list-pane').style.display = (tab === 'setup' || tab === 'home') ? 'none' : '';
+  setStatus(TAB_STATUS[tab] || '');
+  if (tab === 'home') { loadHome(); }
+  else if (tab === 'jira') {
     if (state.jira.view === 'boards') renderJiraBoardHead();
     else if (state.jira.view === 'backlog') renderJiraBacklogHead();
     else { renderJiraListHead(); loadJiraIssues(); }
@@ -266,6 +272,48 @@ function wireAttachments(uploadPath) {
   if (btn) btn.onclick = () => inp.click();
 }
 let refreshDetail = () => {};
+
+/* ============ HOME (dashboard-lite) ============ */
+async function loadHome() {
+  setStatus('LOADING HOME...');
+  try {
+    state.home.data = await api('/api/home');
+    renderHome();
+    setStatus('HOME READY — 0-3 TABS · CLICK A KEY TO OPEN');
+    blip(1200, .04);
+  } catch (e) { renderHome(); }
+}
+
+function renderHome() {
+  const d = state.home.data || {};
+  const row = (it, extra) => `
+    <div class="link-row">
+      <a class="link-key home-key" data-key="${esc(it.key)}">${esc(it.key)}</a>
+      <span class="link-sum">${esc(it.summary || '')} · ${esc(it.status || '')}${it.assignee ? ' · ' + esc(it.assignee) : ''}</span>
+      <span class="link-desc">${esc(extra || (it.duedate ? 'DUE ' + it.duedate : (it.updated || '').slice(0, 10)))}</span>
+    </div>`;
+  const bucket = (title, items, extraFn) => `
+    <div class="detail-section"><h2>${title} <span class="sub">(${(items || []).length})</span></h2>
+      ${(items || []).map(it => row(it, extraFn && extraFn(it))).join('') || '<div class="sub">NOTHING HERE. ENJOY IT.</div>'}
+    </div>`;
+  $('#detail-body').innerHTML = `
+    <div class="detail-head">
+      <h1>HOME // YOUR WORK</h1>
+      <div class="sub">MY OPEN · DUE THIS WEEK · WATCHED · ACTIVE SPRINT — CLICK A KEY TO OPEN IN JIRA</div>
+      <div class="btn-row" style="margin-top:6px"><button id="home-reload" class="act">[ R / RELOAD ]</button></div>
+    </div>
+    ${bucket('MY OPEN ISSUES', d.mine)}
+    ${bucket('DUE THIS WEEK', d.due, it => 'DUE ' + (it.duedate || ''))}
+    ${bucket('WATCHED ISSUES', d.watched)}
+    ${bucket('ACTIVE SPRINT', d.sprint, it => (it.updated || '').slice(0, 10))}`;
+  document.querySelectorAll('.home-key').forEach(a => a.addEventListener('click', () => {
+    state.jira.view = 'issues';
+    switchTab('jira');
+    openJiraIssue(a.dataset.key);
+  }));
+  const hr = $('#home-reload');
+  if (hr) hr.onclick = loadHome;
+}
 
 /* ============ JIRA ============ */
 const JQL_PRESETS = [
@@ -632,6 +680,7 @@ async function voteIssue(key) {
   await openJiraIssue(key);
 }
 
+let wlEditId = null;
 async function loadWorklogs(key) {
   const box = $('#worklog-list');
   if (!box) return;
@@ -642,7 +691,27 @@ async function loadWorklogs(key) {
       <div class="link-row">
         <span class="link-desc">${esc(w.timeSpent || '')}</span>
         <span class="link-sum">${esc(w.author || '')} · ${esc((w.started || '').slice(0, 10))}${w.comment ? ' · ' + esc(w.comment) : ''}</span>
+        <button class="act wl-edit" data-wid="${esc(w.id)}" data-time="${esc(w.timeSpent || '')}" data-date="${esc((w.started || '').slice(0, 10))}" data-comment="${esc(w.comment || '')}">[E]</button>
+        <button class="act danger wl-del" data-wid="${esc(w.id)}">[X]</button>
       </div>`).join('') || '<div class="sub">NO WORK LOGGED.</div>';
+    box.querySelectorAll('.wl-edit').forEach(b => b.addEventListener('click', () => {
+      wlEditId = b.dataset.wid;
+      $('#wl-time').value = b.dataset.time || '';
+      $('#wl-date').value = b.dataset.date || '';
+      $('#wl-comment').value = b.dataset.comment || '';
+      $('#wl-add').textContent = '[ SAVE ]';
+      $('#wl-time').focus();
+    }));
+    box.querySelectorAll('.wl-del').forEach(b => b.addEventListener('click', async () => {
+      const ok = await confirmDialog('[ DELETE ] WORKLOG',
+        'DELETE WORKLOG ENTRY ' + b.dataset.wid + '?');
+      if (!ok) return;
+      await api('/api/jira/issue/' + encodeURIComponent(key) +
+        '/worklog/' + encodeURIComponent(b.dataset.wid), { method: 'DELETE' });
+      toast('WORKLOG DELETED', 'ok');
+      wlEditId = null;
+      loadWorklogs(key);
+    }));
   } catch (e) { box.innerHTML = '<div class="sub">WORKLOG UNAVAILABLE</div>'; }
 }
 
@@ -655,9 +724,17 @@ async function addWorklog() {
   if (d) body.started = d + 'T12:00:00.000+0000';
   const c = ($('#wl-comment') || {}).value.trim();
   if (c) body.comment = c;
-  await api('/api/jira/issue/' + encodeURIComponent(it.key) + '/worklog',
-    { method: 'POST', body });
-  toast('WORK LOGGED', 'ok'); blip(1200, .04);
+  if (wlEditId) {
+    await api('/api/jira/issue/' + encodeURIComponent(it.key) +
+      '/worklog/' + encodeURIComponent(wlEditId), { method: 'PUT', body });
+    toast('WORKLOG UPDATED', 'ok');
+  } else {
+    await api('/api/jira/issue/' + encodeURIComponent(it.key) + '/worklog',
+      { method: 'POST', body });
+    toast('WORK LOGGED', 'ok'); blip(1200, .04);
+  }
+  wlEditId = null;
+  $('#wl-add').textContent = '[ LOG ]';
   loadWorklogs(it.key);
   $('#wl-time').value = ''; $('#wl-comment').value = '';
 }
@@ -799,9 +876,63 @@ async function postComment() {
   await openJiraIssue(it.key);
 }
 
+const isCommentField = (fid, f) =>
+  /comment/i.test(fid) || /comment/i.test((f && f.name) || '');
+
+function transitionForm(t) {
+  const it = state.jira.detail;
+  const fields = t.fields || {};
+  const fids = Object.keys(fields);
+  if (!fids.length) return false;
+  let html = '';
+  for (const fid of fids) {
+    const f = fields[fid] || {};
+    const label = ((f.name || fid) + (f.required ? ' *' : '')).toUpperCase();
+    const av = f.allowedValues || [];
+    if (av.length) {
+      html += `<label>${esc(label)}</label><select id="tf-${esc(fid)}">` +
+        av.map(v => `<option value="${esc(v.id || v.value)}" data-name="${esc(v.value || v.id || '')}">${esc(v.value || v.id || '')}</option>`).join('') +
+        `</select>`;
+    } else if (isCommentField(fid, f)) {
+      html += `<label>${esc(label)}</label><textarea id="tf-${esc(fid)}" class="comment-box" rows="3" placeholder="COMMENT..."></textarea>`;
+    } else {
+      html += `<label>${esc(label)}</label><input id="tf-${esc(fid)}" type="text">`;
+    }
+  }
+  openEditor({
+    title: false, fieldsHTML: html, html: '',
+    onSave: async () => {
+      const tf = {};
+      for (const fid of fids) {
+        const f = fields[fid] || {};
+        const el = document.getElementById('tf-' + fid);
+        if (!el || !el.value) {
+          if (f.required) { toast('REQUIRED: ' + (f.name || fid).toUpperCase(), 'err'); throw new Error('validation'); }
+          continue;
+        }
+        if ((f.allowedValues || []).length) {
+          const opt = el.selectedOptions && el.selectedOptions[0];
+          tf[fid] = { id: el.value, name: opt ? opt.dataset.name : el.value };
+        } else {
+          tf[fid] = isCommentField(fid, f) ? textToHtml(el.value) : el.value;
+        }
+      }
+      setStatus('TRANSITIONING ' + it.key + '...');
+      await api('/api/jira/issue/' + encodeURIComponent(it.key), {
+        method: 'PUT', body: { transition_id: t.id, transition_fields: tf },
+      });
+      toast('STATUS TRANSITIONED', 'ok'); blip(1200, .04);
+      await openJiraIssue(it.key);
+    },
+  });
+  return true;
+}
+
 async function applyTransition(tid) {
   const it = state.jira.detail;
   if (!tid) return;
+  const t = (it.transitions || []).find(x => String(x.id) === String(tid));
+  if (t && transitionForm(t)) return;
   await api('/api/jira/issue/' + encodeURIComponent(it.key), {
     method: 'PUT', body: { transition_id: tid },
   });
@@ -882,6 +1013,7 @@ function renderJiraBoardHead() {
     <div class="btn-row">
       <button id="b-load" class="act primary">[ LOAD BOARD ]</button>
       <button id="b-group" class="act">[ GROUP: ${j.group.toUpperCase()} ]</button>
+      ${j.boardProject ? `<button id="b-vers" class="act">[ ${j.versionsMode ? 'BOARD' : 'VERSIONS'} ]</button>` : ''}
       ${j.board ? `<button id="b-newsprint" class="act">[ NEW SPRINT ]</button>
       ${j.sprint && j.sprint.state === 'future' ? '<button id="b-start" class="act">[ START ]</button>' : ''}
       ${j.sprint && j.sprint.state === 'active' ? '<button id="b-close" class="act">[ COMPLETE ]</button>' : ''}` : ''}
@@ -891,6 +1023,7 @@ function renderJiraBoardHead() {
   $('#b-project').addEventListener('change', async e => {
     j.boardProject = e.target.value;
     j.board = null; j.sprints = []; j.sprint = null; j.columns = [];
+    j.versionsMode = false; j.versions = null;
     setStatus('FETCHING BOARDS...');
     try {
       j.boards = await api('/api/jira/boards?project=' + encodeURIComponent(j.boardProject));
@@ -901,6 +1034,7 @@ function renderJiraBoardHead() {
   $('#b-board').addEventListener('change', async e => {
     j.board = j.boards.find(b => String(b.id) === e.target.value) || null;
     j.sprints = []; j.sprint = null; j.columns = [];
+    j.versionsMode = false; j.versions = null;
     if (!j.board) { renderJiraBoardHead(); return; }
     setStatus('FETCHING SPRINTS...');
     try {
@@ -912,6 +1046,7 @@ function renderJiraBoardHead() {
   });
   $('#b-sprint').addEventListener('change', async e => {
     j.sprint = j.sprints.find(s => String(s.id) === e.target.value) || null;
+    j.versionsMode = false;
     if (j.sprint) await loadBoard();
     renderJiraBoardHead();
   });
@@ -920,6 +1055,8 @@ function renderJiraBoardHead() {
     j.group = j.group === 'status' ? 'epic' : 'status';
     if (j.sprint) loadBoard(); else renderJiraBoardHead();
   });
+  const bv = $('#b-vers');
+  if (bv) bv.onclick = toggleVersions;
   const ns = $('#b-newsprint');
   if (ns) ns.onclick = async () => {
     const name = prompt('NEW SPRINT NAME');
@@ -936,6 +1073,38 @@ function renderJiraBoardHead() {
   if (st) st.onclick = () => sprintState('active');
   const cl = $('#b-close');
   if (cl) cl.onclick = () => sprintState('closed');
+}
+
+async function toggleVersions() {
+  const j = state.jira;
+  j.versionsMode = !j.versionsMode;
+  renderJiraBoardHead();
+  if (!j.versionsMode) {
+    if (j.sprint && j.columns.length) renderBoard();
+    return;
+  }
+  setStatus('FETCHING VERSIONS...');
+  try {
+    j.versions = await api('/api/jira/project/' + encodeURIComponent(j.boardProject) + '/versions');
+  } catch (e) { j.versions = []; }
+  renderVersions();
+}
+
+function renderVersions() {
+  const j = state.jira;
+  const vs = j.versions || [];
+  $('#detail-body').innerHTML = `
+    <div class="detail-head">
+      <h1>VERSIONS // ${esc(j.boardProject || '')}</h1>
+      <div class="sub">${vs.length} RELEASE(S) · [ VERSIONS ] BUTTON TOGGLES BACK TO THE BOARD</div>
+    </div>
+    ${vs.map(v => `
+      <div class="link-row">
+        <span class="link-desc">${v.released ? 'RELEASED' : v.archived ? 'ARCHIVED' : 'OPEN'}</span>
+        <span class="link-key">${esc(v.name)}</span>
+        <span class="link-sum">${v.issues == null ? '?' : v.issues} ISSUE(S)${v.releaseDate ? ' · ' + esc(v.releaseDate) : ''}${v.dueDate ? ' · DUE ' + esc(v.dueDate) : ''}</span>
+      </div>`).join('') || '<div class="empty">NO VERSIONS DEFINED FOR THIS PROJECT.</div>'}`;
+  setStatus('VERSIONS LOADED');
 }
 
 async function sprintState(state_) {
@@ -1090,6 +1259,11 @@ async function moveCardToColumn(s, i, ns) {
       names.includes((x.to || '').toLowerCase()) ||
       names.includes((x.name || '').toLowerCase()));
     if (!t) { toast('NO TRANSITION TO ' + target.name.toUpperCase(), 'err'); return; }
+    if (t.fields && Object.keys(t.fields).length) {
+      state.jira.detail = d;
+      transitionForm(t);
+      return;
+    }
     await api('/api/jira/issue/' + encodeURIComponent(card.key), {
       method: 'PUT', body: { transition_id: t.id },
     });
@@ -1196,10 +1370,10 @@ function renderBacklog() {
     return;
   }
   $('#detail-body').innerHTML = secs.map((sec, si) => `
-    <div class="detail-section">
+    <div class="detail-section bl-sec" data-si="${si}">
       <h2>${esc(sec.name)} <span class="sub">(${sec.issues.length})</span></h2>
       ${sec.issues.map((c, i) => `
-        <div class="link-row bl-row" data-si="${si}" data-i="${i}">
+        <div class="link-row bl-row" data-si="${si}" data-i="${i}" draggable="true">
           <input type="checkbox" class="ck" data-key="${esc(c.key)}"${j.backlog.checked.has(c.key) ? ' checked' : ''}>
           <a class="link-key" data-key="${esc(c.key)}">${esc(c.key)}</a>
           <span class="link-sum">${esc(c.summary)} · ${esc(c.status || '')}</span>
@@ -1228,6 +1402,61 @@ function renderBacklog() {
       await loadBacklog();
     } catch (err) { /* toast shown */ }
   }));
+  // drag-position ranking: drop on a row = insert before it; drop on the
+  // section body below the last row = rank after the last issue
+  document.querySelectorAll('.bl-row').forEach(row => {
+    row.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/plain',
+        JSON.stringify({ si: +row.dataset.si, i: +row.dataset.i }));
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    row.addEventListener('dragover', e => { e.preventDefault(); row.classList.add('drop'); });
+    row.addEventListener('dragleave', () => row.classList.remove('drop'));
+    row.addEventListener('drop', async e => {
+      e.preventDefault(); e.stopPropagation(); row.classList.remove('drop');
+      try {
+        const d = JSON.parse(e.dataTransfer.getData('text/plain'));
+        if (d.si !== +row.dataset.si) return;  // rank within a section only
+        const ti = +row.dataset.i;
+        await rankMove(secs[d.si], d.i, ti);
+      } catch (err) { /* bad payload */ }
+    });
+  });
+  document.querySelectorAll('.bl-sec').forEach(secEl => {
+    const si = +secEl.dataset.si, sec = secs[si];
+    secEl.addEventListener('dragover', e => e.preventDefault());
+    secEl.addEventListener('drop', async e => {
+      if (e.target.closest('.bl-row')) return;  // row handled it
+      e.preventDefault();
+      try {
+        const d = JSON.parse(e.dataTransfer.getData('text/plain'));
+        if (d.si !== si || !sec.issues.length) return;
+        const dk = sec.issues[d.i].key;
+        if (sec.issues[sec.issues.length - 1].key === dk) return;
+        await api('/api/jira/issues/rank', { method: 'POST',
+          body: { keys: [dk], after: sec.issues[sec.issues.length - 1].key } });
+        toast(dk + ' RANKED LAST', 'ok');
+        await loadBacklog();
+      } catch (err) { /* bad payload */ }
+    });
+  });
+}
+
+async function rankMove(sec, i, ti) {
+  const issues = sec.issues;
+  const dk = issues[i].key;
+  if (dk === issues[ti].key) return;
+  // drop on row ti = insert before it; count neighbours excluding self
+  const others = issues.filter(x => x.key !== dk);
+  const pos = issues.slice(0, ti).filter(x => x.key !== dk).length;
+  let body;
+  if (!others.length) return;
+  else if (pos <= 0) body = { keys: [dk], before: others[0].key };
+  else if (pos >= others.length) body = { keys: [dk], after: others[others.length - 1].key };
+  else body = { keys: [dk], before: others[pos].key };
+  await api('/api/jira/issues/rank', { method: 'POST', body });
+  toast(dk + ' RANKED', 'ok');
+  await loadBacklog();
 }
 
 async function moveChecked(kind) {
@@ -1349,7 +1578,9 @@ function renderConfDetail() {
   const labels = (p.labels || []).map(l =>
     `<span class="chip">${esc(l)}<a class="chip-x" data-label="${esc(l)}">×</a></span>`).join(' ');
   const atts = attRowsHtml(p.attachments);
-  const diagrams = (p.diagrams || []).map(d => d.image
+  const diagrams = (p.diagrams || []).map(d => d.svg
+    ? `<div class="diagram"><div class="sub">${esc(d.name)}</div>${d.svg}</div>`
+    : d.image
     ? `<div class="diagram"><div class="sub">${esc(d.name)}</div><img src="${esc(d.url)}" loading="lazy"></div>`
     : `<div class="link-row"><span class="link-desc">DIAGRAM</span><a class="link-key" href="${esc(d.url)}">${esc(d.name)}</a></div>`).join('');
   $('#detail-body').innerHTML = `
@@ -1375,6 +1606,11 @@ function renderConfDetail() {
       <button id="hist-btn" class="act">[ HISTORY ]</button></div>
       <div id="hist-box"></div>
     </div>
+    <div class="detail-section"><h2>COMMENTS</h2>
+      <div id="conf-comments"><div class="sub">LOADING...</div></div>
+      <textarea id="pgcmt" class="comment-box" placeholder="WRITE A COMMENT..."></textarea>
+      <div class="btn-row"><button id="pgcmt-post" class="act primary">[ POST COMMENT ]</button></div>
+    </div>
     <div class="btn-row">
       <button id="d-edit" class="act primary">[ E / EDIT ]</button>
       <button id="d-back" class="act">[ ESC / BACK ]</button>
@@ -1383,6 +1619,9 @@ function renderConfDetail() {
   $('#d-edit').onclick = editConfPage;
   $('#d-back').onclick = backToList;
   $('#d-del').onclick = deleteConfPage;
+  $('#pgcmt-post').onclick = postConfComment;
+  confReplyTo = null;
+  loadConfComments(p.id);
   document.querySelectorAll('.chip-x').forEach(x => x.addEventListener('click', async () => {
     await api('/api/confluence/page/' + encodeURIComponent(p.id) + '/label?name=' +
       encodeURIComponent(x.dataset.label), { method: 'DELETE' });
@@ -1437,6 +1676,57 @@ function renderConfDetail() {
       hb.dataset.loaded = '1';
     } catch (e) { hb.innerHTML = '<div class="sub">HISTORY UNAVAILABLE</div>'; }
   };
+}
+
+let confReplyTo = null;
+async function loadConfComments(pid) {
+  const box = $('#conf-comments');
+  if (!box) return;
+  try {
+    const cs = await api('/api/confluence/page/' + encodeURIComponent(pid) + '/comments');
+    const tops = cs.filter(c => !c.parent);
+    const byParent = {};
+    cs.forEach(c => { if (c.parent) (byParent[c.parent] = byParent[c.parent] || []).push(c); });
+    const row = (c, indent) => `
+      <div class="comment"${indent ? ' style="margin-left:28px"' : ''}>
+        <div class="who">${esc(c.author)} — ${esc((c.when || '').replace('T', ' ').slice(0, 16))}
+          <button class="act cmt-reply" data-cid="${esc(c.id)}" data-author="${esc(c.author || '')}">[R]</button>
+          <button class="act danger cmt-del" data-cid="${esc(c.id)}">[X]</button></div>
+        <div class="detail-body-html">${c.body_html || ''}</div>
+        ${(byParent[c.id] || []).map(r => row(r, true)).join('')}
+      </div>`;
+    box.innerHTML = tops.map(c => row(c, false)).join('') || '<div class="sub">NO COMMENTS.</div>';
+    box.querySelectorAll('.cmt-del').forEach(b => b.addEventListener('click', async () => {
+      const ok = await confirmDialog('[ DELETE ] COMMENT', 'DELETE THIS COMMENT?');
+      if (!ok) return;
+      await api('/api/confluence/comment/' + encodeURIComponent(b.dataset.cid), { method: 'DELETE' });
+      toast('COMMENT DELETED', 'ok');
+      loadConfComments(pid);
+    }));
+    box.querySelectorAll('.cmt-reply').forEach(b => b.addEventListener('click', () => {
+      confReplyTo = b.dataset.cid;
+      const ta = $('#pgcmt');
+      ta.value = '';
+      ta.placeholder = 'REPLY TO ' + (b.dataset.author || 'COMMENT') + '...';
+      ta.focus();
+    }));
+  } catch (e) { box.innerHTML = '<div class="sub">COMMENTS UNAVAILABLE</div>'; }
+}
+
+async function postConfComment() {
+  const p = state.conf.detail;
+  const ta = $('#pgcmt');
+  if (!p || !ta) return;
+  const text = ta.value.trim();
+  if (!text) return;
+  const body = { body_html: textToHtml(text) };
+  if (confReplyTo) body.parent_id = confReplyTo;
+  await api('/api/confluence/page/' + encodeURIComponent(p.id) + '/comment',
+    { method: 'POST', body });
+  toast('COMMENT POSTED', 'ok'); blip(1200, .04);
+  confReplyTo = null;
+  ta.value = ''; ta.placeholder = 'WRITE A COMMENT...';
+  loadConfComments(p.id);
 }
 
 function editConfPage() {
@@ -1605,13 +1895,21 @@ window.addEventListener('keydown', async e => {
   if (e.key === 'Escape') {
     if (typingTarget()) { document.activeElement.blur(); return; }
     if (state.tab === 'setup') switchTab('jira');
-    else if (cur().mode === 'detail') backToList();
+    else if (state.tab !== 'home' && cur().mode === 'detail') backToList();
     return;
   }
   if (typingTarget()) return;
   if (state.tab === 'setup') {
-    if (e.key === '1' || e.key === '2' || e.key === '3') { e.preventDefault(); switchTab(TABS[+e.key - 1]); }
+    if (/^[0-3]$/.test(e.key)) { e.preventDefault(); switchTab(TABS[+e.key]); }
     else if (e.key === '?') { e.preventDefault(); toggleHelp(true); }
+    return;
+  }
+
+  // ---- home dashboard owns the keyboard ----
+  if (state.tab === 'home') {
+    if (/^[0-3]$/.test(e.key)) { e.preventDefault(); switchTab(TABS[+e.key]); }
+    else if (e.key === '?') { e.preventDefault(); toggleHelp(true); }
+    else if (e.key === 'r') { e.preventDefault(); loadHome(); }
     return;
   }
 
@@ -1621,8 +1919,8 @@ window.addEventListener('keydown', async e => {
   if (state.tab === 'jira' && state.jira.view === 'boards' && s.mode !== 'detail') {
     const flat = boardFlat();
     switch (e.key) {
-      case '1': case '2': case '3':
-        e.preventDefault(); switchTab(TABS[+e.key - 1]); return;
+      case '0': case '1': case '2': case '3':
+        e.preventDefault(); switchTab(TABS[+e.key]); return;
       case '?': e.preventDefault(); toggleHelp(true); return;
       case '/': e.preventDefault(); const bp = $('#b-project'); if (bp) bp.focus(); return;
       case 'j': case 'ArrowDown': boardMove(1); return;
@@ -1643,8 +1941,8 @@ window.addEventListener('keydown', async e => {
   const list = state.tab === 'jira' ? state.jira.issues : state.conf.pages;
 
   switch (e.key) {
-    case '1': case '2': case '3':
-      e.preventDefault(); switchTab(TABS[+e.key - 1]); break;
+    case '0': case '1': case '2': case '3':
+      e.preventDefault(); switchTab(TABS[+e.key]); break;
     case '?': e.preventDefault(); toggleHelp(true); break;
     case '/': {
       e.preventDefault();

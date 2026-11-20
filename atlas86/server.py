@@ -1,7 +1,11 @@
 import io
 import json
 import re
+import zlib
+import base64
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from urllib.parse import quote, urlparse
 
@@ -151,11 +155,119 @@ def _diagram_previews(storage_html, attachments):
             continue
         seen.add(name)
         mime = a.get("mime") or ""
-        out.append({"name": name, "url": a["url"],
+        out.append({"name": name, "url": a["url"], "dl": a.get("dl"),
                     "image": mime.startswith("image/") or
                     (a.get("filename") or "").lower().endswith(
                         (".png", ".svg", ".jpg", ".jpeg"))})
     return out[:20]
+
+
+_DRAWIO_MAX_CELLS = 120
+
+
+def _drawio_svg(raw):
+    """Extract a read-only SVG preview from a .drawio attachment.
+
+    mxfile <diagram> payloads are either inline mxGraphModel XML or
+    base64+zlib-compressed XML. Returns a self-contained <svg> string
+    (rects + text labels + edges) or None when nothing parseable is found.
+    """
+    try:
+        text = raw.decode("utf-8", "replace") if isinstance(
+            raw, (bytes, bytearray)) else str(raw)
+    except Exception:
+        return None
+    models = []
+    for m in re.finditer(r"<diagram\b[^>]*>(.*?)</diagram>", text, re.S):
+        content = m.group(1).strip()
+        xml = content if "<mxGraphModel" in content else None
+        if xml is None:
+            try:
+                comp = base64.b64decode(content)
+                for wbits in (-15, 15, 31):
+                    try:
+                        xml = zlib.decompress(comp, wbits).decode(
+                            "utf-8", "replace")
+                        break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        if xml and "<mxGraphModel" in xml:
+            models.append(xml)
+    if not models:
+        if "<mxGraphModel" in text:
+            models.append(text)
+        else:
+            return None
+    tag = lambda el: el.tag.rsplit("}", 1)[-1]
+    vertices, edges, skipped = {}, [], 0
+    minx = miny = float("inf")
+    maxx = maxy = float("-inf")
+    for xml in models[:3]:
+        try:
+            root = ET.fromstring(xml)
+        except Exception:
+            continue
+        for cell in root.iter():
+            if tag(cell) != "mxCell":
+                continue
+            if skipped >= _DRAWIO_MAX_CELLS:
+                break
+            cid = cell.get("id") or ""
+            if cell.get("vertex") == "1" and cid:
+                geo = next((ch for ch in cell if tag(ch) == "mxGeometry"),
+                           None)
+                try:
+                    x = float(geo.get("x", 0)) if geo is not None else 0.0
+                    y = float(geo.get("y", 0)) if geo is not None else 0.0
+                    w = float(geo.get("width", 60)) if geo is not None else 60.0
+                    h = float(geo.get("height", 30)) if geo is not None else 30.0
+                except (TypeError, ValueError):
+                    continue
+                label = re.sub(r"<[^>]+>", "", cell.get("value") or "")
+                label = (label.replace("&lt;", "<").replace("&gt;", ">")
+                         .replace("&amp;", "&").strip())
+                vertices[cid] = (x, y, w, h, label)
+                minx, miny = min(minx, x), min(miny, y)
+                maxx, maxy = max(maxx, x + w), max(maxy, y + h)
+                skipped += 1
+            elif cell.get("edge") == "1" and cell.get("source"):
+                edges.append((cell.get("source"), cell.get("target")))
+    if not vertices:
+        return None
+    pad = 8
+    w = max(1.0, maxx - minx + 2 * pad)
+    h = max(1.0, maxy - miny + 2 * pad)
+    esc = lambda s: (s.replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;").replace('"', "&quot;"))
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="'
+           f'{minx - pad:.1f} {miny - pad:.1f} {w:.1f} {h:.1f}" '
+           f'width="{w:.0f}" height="{h:.0f}">',
+           '<rect width="100%" height="100%" fill="#0a0f0a"/>']
+    cx = lambda v: v[0] + v[2] / 2 - minx + pad
+    cy = lambda v: v[1] + v[3] / 2 - miny + pad
+    for s, t in edges:
+        if s in vertices and t in vertices:
+            x1, y1 = cx(vertices[s]), cy(vertices[s])
+            x2, y2 = cx(vertices[t]), cy(vertices[t])
+            out.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" '
+                       f'y2="{y2:.1f}" stroke="#33ff66" stroke-width="1.5"/>')
+            out.append(f'<polygon points="{x2:.1f},{y2:.1f} '
+                       f'{x2 - 6:.1f},{y2 - 3:.1f} {x2 - 6:.1f},{y2 + 3:.1f}" '
+                       'fill="#33ff66"/>')
+    for x, y, vw, vh, label in vertices.values():
+        rx, ry = x - minx + pad, y - miny + pad
+        out.append(f'<rect x="{rx:.1f}" y="{ry:.1f}" width="{vw:.1f}" '
+                   f'height="{vh:.1f}" fill="#050805" stroke="#33ff66" '
+                   'stroke-width="1.5" rx="3"/>')
+        if label:
+            out.append(f'<text x="{rx + vw / 2:.1f}" y="{ry + vh / 2:.1f}" '
+                       'text-anchor="middle" dominant-baseline="middle" '
+                       'fill="#33ff66" font-family="monospace" '
+                       f'font-size="12">{esc(label[:60])}</text>')
+    out.append("</svg>")
+    return "".join(out)
 
 
 _FIELD_LABELS = {"duedate": "Due Date", "fixVersions": "Fix Versions",
@@ -341,6 +453,16 @@ def create_app():
             {"key": p.get("key"), "name": p.get("name")}
             for p in (holder["client"].jira.projects() or [])])
 
+    def _issue_brief(i):
+        f = i.get("fields") or {}
+        return {"key": i.get("key"), "summary": f.get("summary"),
+                "status": (f.get("status") or {}).get("name"),
+                "issuetype": (f.get("issuetype") or {}).get("name"),
+                "assignee": _display(f.get("assignee")),
+                "priority": (f.get("priority") or {}).get("name"),
+                "duedate": f.get("duedate"),
+                "updated": f.get("updated")}
+
     @app.get("/api/jira/issues")
     @api
     def jira_issues():
@@ -350,38 +472,43 @@ def create_app():
 
         def fetch():
             data = holder["client"].jira.jql(jql, fields="*all", limit=limit) or {}
-            issues = []
-            for i in data.get("issues", []):
-                f = i.get("fields") or {}
-                issues.append({
-                    "key": i.get("key"),
-                    "summary": f.get("summary"),
-                    "status": (f.get("status") or {}).get("name"),
-                    "issuetype": (f.get("issuetype") or {}).get("name"),
-                    "assignee": _display(f.get("assignee")),
-                    "priority": (f.get("priority") or {}).get("name"),
-                    "updated": f.get("updated"),
-                })
-            return {"jql": jql, "issues": issues}
+            return {"jql": jql,
+                    "issues": [_issue_brief(i) for i in data.get("issues", [])]}
 
         return cache_wrap(key, 30, fetch)
 
     def _issue_detail(key):
         c = holder["client"]
-        issue, trans, remotes = _parallel([
+        issue, trans_raw, remotes = _parallel([
             lambda: c.jira.issue(key, fields="*all", expand="renderedFields") or {},
-            lambda: c.jira.get_issue_transitions(key) or [],
+            lambda: c.jira.get(
+                f"rest/api/{_ver(c)}/issue/{key}/transitions"
+                "?expand=transitions.fields") or {},
             lambda: c.jira.get(f"rest/api/{_ver(c)}/issue/{key}/remotelink") or [],
         ])
+        if isinstance(trans_raw, list):
+            trans_list = trans_raw
+        else:
+            trans_list = trans_raw.get("transitions") or []
         f = issue.get("fields") or {}
         rf = issue.get("renderedFields") or {}
         comments = [{"author": _display(cm.get("author")),
                      "created": cm.get("created"),
                      "body_html": cm.get("body") or ""}
                     for cm in (rf.get("comment") or {}).get("comments", [])]
-        transitions = [{"id": t.get("id"), "name": t.get("name"),
-                        "to": ((t.get("to") or {}).get("name"))}
-                       for t in trans]
+        transitions = []
+        for t in trans_list:
+            fields_meta = {}
+            for fid, fd in ((t.get("fields") or {}).items()):
+                fields_meta[fid] = {
+                    "name": fd.get("name"), "required": fd.get("required"),
+                    "allowedValues": [
+                        {"id": v.get("id"),
+                         "value": v.get("value") or v.get("name")}
+                        for v in (fd.get("allowedValues") or [])][:30]}
+            transitions.append({"id": t.get("id"), "name": t.get("name"),
+                                "to": ((t.get("to") or {}).get("name")),
+                                "fields": fields_meta or None})
         itype = (f.get("issuetype") or {}).get("name") or ""
         epic = _epic_key(c, f)
         children = None
@@ -542,8 +669,22 @@ def create_app():
                 c.jira.put(f"rest/api/3/issue/{key}", data={"fields": fields})
             else:
                 c.jira.issue_update(key, fields)
-        if b.get("transition_id") not in (None, ""):
-            c.jira.set_issue_status_by_transition_id(key, b["transition_id"])
+        tid = b.get("transition_id")
+        tfields = b.get("transition_fields")
+        if isinstance(tfields, dict):
+            # transition screens may prompt for a comment; body arrives as
+            # sanitized html and needs the cloud/server body format
+            tfields = {fid: (html_to_adf(v) if holder["cfg"]["cloud"]
+                             else html_to_wiki(v))
+                       if fid == "comment" and isinstance(v, str) else v
+                       for fid, v in tfields.items()}
+        if tid not in (None, ""):
+            if tfields:
+                c.jira.post(f"rest/api/{_ver(c)}/issue/{key}/transitions",
+                           data={"transition": {"id": tid},
+                                 "fields": tfields})
+            else:
+                c.jira.set_issue_status_by_transition_id(key, tid)
         invalidate()
         return {"ok": True}
 
@@ -822,12 +963,77 @@ def create_app():
         b = body()
         keys = b.get("keys") or []
         before = b.get("before")
+        after = b.get("after")
         fid = _rank_fid()
-        if not keys or not before or not fid:
-            return jsonify(error="keys, before and a Rank field are required"), 400
-        holder["client"].jira.update_rank(keys[:50], before, fid)
+        if not keys or not fid or not (before or after):
+            return jsonify(error="keys, before|after and a Rank field are required"), 400
+        if before:
+            holder["client"].jira.update_rank(keys[:50], before, fid)
+        else:
+            holder["client"].jira.put(
+                holder["client"].jira.get_agile_resource_url("issue/rank"),
+                data={"issues": keys[:50], "rankAfterIssue": after,
+                      "rankCustomFieldId": fid})
         invalidate()
         return {"ok": True}
+
+    @app.get("/api/jira/project/<key>/versions")
+    @api
+    def jira_versions(key):
+        def fetch():
+            c = holder["client"]
+            try:
+                vers = c.jira.get_project_versions(key) or []
+            except Exception:
+                return []
+            vers = [v for v in vers if isinstance(v, dict)][:25]
+
+            def count(v):
+                try:
+                    jql = ('project = "%s" AND fixVersion = "%s"'
+                           % (key, (v.get("name") or "").replace('"', '""')))
+                    data = c.jira.jql(jql, fields="summary", limit=1) or {}
+                    return data.get("total", len(data.get("issues", [])))
+                except Exception:
+                    return None
+            out = _parallel([lambda v=v: {**{k: v.get(k) for k in
+                    ("name", "released", "releaseDate", "archived",
+                     "startDate", "dueDate")},
+                    "issues": count(v)} for v in vers])
+            return out
+        return cache_wrap(f"jira:versions:{key}", 120, fetch)
+
+    @app.get("/api/home")
+    @api
+    def home():
+        c = holder["client"]
+
+        def one(jql):
+            try:
+                data = c.jira.jql(jql, fields="summary,status,issuetype,"
+                                  "assignee,priority,updated", limit=8) or {}
+                return [_issue_brief(i) for i in data.get("issues", [])]
+            except Exception:
+                return []
+
+        today = datetime.now(timezone.utc).date()
+        monday = today - timedelta(days=today.weekday())
+        sunday = monday + timedelta(days=6)
+
+        def fetch():
+            mine, due, watched, sprint = _parallel([
+                lambda: one('assignee = currentUser() AND resolution = Unresolved'
+                            ' ORDER BY updated DESC'),
+                lambda: one('duedate >= "%s" AND duedate <= "%s"'
+                            ' AND resolution = Unresolved ORDER BY duedate'
+                            % (monday.isoformat(), sunday.isoformat())),
+                lambda: one('watcher = currentUser() AND resolution = Unresolved'
+                            ' ORDER BY updated DESC'),
+                lambda: one('sprint in openSprints() ORDER BY updated DESC'),
+            ])
+            return {"mine": mine, "due": due, "watched": watched,
+                    "sprint": sprint}
+        return cache_wrap("home", 60, fetch)
 
     @app.post("/api/jira/sprints")
     @api
@@ -889,6 +1095,38 @@ def create_app():
                 data["comment"] = comment
         holder["client"].jira.post(
             f"rest/api/{ver}/issue/{key}/worklog", data=data)
+        invalidate()
+        return {"ok": True}
+
+    @app.put("/api/jira/issue/<key>/worklog/<wid>")
+    @api
+    def jira_worklog_update(key, wid):
+        b = body()
+        ver = _ver(holder["client"])
+        data = {}
+        if b.get("timeSpent"):
+            data["timeSpent"] = b["timeSpent"]
+        if b.get("started"):
+            data["started"] = b["started"]
+        comment = (b.get("comment") or "").strip()
+        if comment:
+            if holder["cfg"]["cloud"]:
+                data["comment"] = {"type": "doc", "version": 1, "content": [
+                    {"type": "paragraph",
+                     "content": [{"type": "text", "text": comment}]}]}
+            else:
+                data["comment"] = comment
+        holder["client"].jira.put(
+            f"rest/api/{ver}/issue/{key}/worklog/{wid}", data=data)
+        invalidate()
+        return {"ok": True}
+
+    @app.delete("/api/jira/issue/<key>/worklog/<wid>")
+    @api
+    def jira_worklog_delete(key, wid):
+        ver = _ver(holder["client"])
+        holder["client"].jira.delete(
+            f"rest/api/{ver}/issue/{key}/worklog/{wid}")
         invalidate()
         return {"ok": True}
 
@@ -1015,6 +1253,7 @@ def create_app():
                         "version": (a.get("version") or {}).get("number"),
                         "url": "/api/confluence/attachment?dl=" + quote(dl, safe="")
                         if dl else None,
+                        "dl": dl or None,
                     })
                 return out
             except Exception:
@@ -1025,6 +1264,19 @@ def create_app():
         space = p.get("space") or {}
         diagrams = _diagram_previews(
             ((p.get("body") or {}).get("storage") or {}).get("value") or "", atts)
+        # for diagram source files with no rendered sibling, try extracting
+        # an SVG straight from the .drawio XML (best effort, capped)
+        targets = [d for d in diagrams
+                   if not d.get("image") and d.get("dl")
+                   and (d.get("name") or "").lower().endswith(".drawio")]
+        if targets:
+            raws = _parallel([
+                lambda d=d: c.get(d["dl"], not_json_response=True)
+                for d in targets[:3]])
+            for d, raw in zip(targets, raws):
+                svg = _drawio_svg(raw)
+                if svg:
+                    d["svg"] = svg
         return {
             "id": str(p.get("id")),
             "title": p.get("title"),
@@ -1071,6 +1323,62 @@ def create_app():
                              .get("id")}
                     for r in read]
         return cache_wrap(f"conf:restr:{page_id}", 120, fetch)
+
+    @app.get("/api/confluence/page/<page_id>/comments")
+    @api
+    def conf_page_comments(page_id):
+        def fetch():
+            c = holder["client"].conf
+            data = c.get(
+                f"rest/api/content/{page_id}/child/comment"
+                "?limit=50&expand=body.view,version,ancestors") or {}
+            out = []
+            for cm in data.get("results", []):
+                ver = cm.get("version") or {}
+                ancestors = cm.get("ancestors") or []
+                parent = str(ancestors[-1].get("id")) \
+                    if len(ancestors) > 1 else None
+                out.append({
+                    "id": str(cm.get("id")),
+                    "author": _display(ver.get("by")),
+                    "when": ver.get("when"),
+                    "body_html": sanitize_html(
+                        ((cm.get("body") or {}).get("view") or {})
+                        .get("value") or ""),
+                    "parent": parent,
+                })
+            return out
+        return cache_wrap(f"conf:comments:{page_id}", 60, fetch)
+
+    @app.post("/api/confluence/page/<page_id>/comment")
+    @api
+    def conf_comment_add(page_id):
+        b = body()
+        storage = sanitize_html(b.get("body_html") or "")
+        if not storage.strip():
+            return jsonify(error="empty comment"), 400
+        c = holder["client"].conf
+        ancestors = [{"id": int(page_id)}]
+        parent = b.get("parent_id")
+        if parent:
+            ancestors.append({"id": int(parent)})
+        c.post("rest/api/content", data={
+            "type": "comment",
+            "container": {"id": int(page_id)},
+            "body": {"storage": {"value": storage,
+                                 "representation": "storage"}},
+            "ancestors": ancestors,
+            "version": {"number": 1},
+        })
+        invalidate()
+        return {"ok": True}
+
+    @app.delete("/api/confluence/comment/<cid>")
+    @api
+    def conf_comment_del(cid):
+        holder["client"].conf.delete(f"rest/api/content/{cid}")
+        invalidate()
+        return {"ok": True}
 
     @app.post("/api/confluence/page/<page_id>/label")
     @api

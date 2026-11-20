@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atlas86"
-version = "0.3.0"
+version = "0.4.0"
 description = "A lightweight local-web Jira + Confluence client with a retro 80s terminal UI"
 readme = "README.md"
 license = { text = "MIT" }
