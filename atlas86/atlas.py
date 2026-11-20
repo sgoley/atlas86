@@ -1,4 +1,31 @@
+import threading
+import time
+
 from atlassian import Confluence, Jira
+
+
+class Cache:
+    """Tiny in-process TTL cache. Single-user local app: clear() on writes."""
+
+    def __init__(self):
+        self._d = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            hit = self._d.get(key)
+            if hit and hit[0] > time.monotonic():
+                return hit[1]
+            self._d.pop(key, None)
+            return None
+
+    def set(self, key, value, ttl=60):
+        with self._lock:
+            self._d[key] = (time.monotonic() + ttl, value)
+
+    def clear(self):
+        with self._lock:
+            self._d.clear()
 
 
 class AtlasClient:
@@ -9,6 +36,7 @@ class AtlasClient:
                     password=cfg["token"], cloud=bool(cfg.get("cloud")))
         self._cloud = bool(cfg.get("cloud"))
         self._fnames = None
+        self.cache = Cache()
         self.jira = Jira(**auth)
         self.conf = Confluence(**auth)
 

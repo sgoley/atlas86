@@ -85,6 +85,7 @@ def create_app():
         holder["client"] = atlas.AtlasClient(cfg) if config.configured(cfg) else None
 
     make_client(holder["cfg"])
+    app.atlas_holder = holder  # exposed for tests / scripts/perf.py
 
     @app.before_request
     def _guard():
