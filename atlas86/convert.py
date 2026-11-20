@@ -257,6 +257,44 @@ def html_to_adf(html):
             "content": _adf_blocks(_clean(_parse(html)))}
 
 
+def adf_to_text(doc):
+    """Flatten an ADF doc/node to plain text (for generic field display)."""
+    out = []
+
+    def walk(n):
+        if isinstance(n, list):
+            for x in n:
+                walk(x)
+            return
+        if not isinstance(n, dict):
+            return
+        t = n.get("type")
+        if t == "text":
+            out.append(n.get("text") or "")
+        elif t == "hardBreak":
+            out.append("\n")
+        elif t in ("paragraph", "heading", "blockquote", "listItem",
+                   "codeBlock", "panel", "rule", "expand", "table",
+                   "tableRow", "tableCell", "tableHeader", "mediaSingle",
+                   "media", "mention", "emoji", "date", "status"):
+            out.append("\n")
+            for c in n.get("content") or []:
+                walk(c)
+            out.append("\n")
+        elif t in ("bulletList", "orderedList", "doc"):
+            for c in n.get("content") or []:
+                walk(c)
+        else:
+            for c in n.get("content") or []:
+                walk(c)
+
+    walk(doc)
+    text = "".join(out)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 # ---------- wiki markup (Jira server/DC) ----------
 
 _WIKI_MARKS = {

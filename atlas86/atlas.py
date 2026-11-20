@@ -35,6 +35,7 @@ class AtlasClient:
         auth = dict(url=cfg["url"], username=cfg.get("user") or "",
                     password=cfg["token"], cloud=bool(cfg.get("cloud")))
         self._cloud = bool(cfg.get("cloud"))
+        self.cloud = self._cloud
         self._fnames = None
         self.cache = Cache()
         self.jira = Jira(**auth)

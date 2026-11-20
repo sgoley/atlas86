@@ -1,18 +1,49 @@
+import io
+import json
 import re
 from functools import wraps
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 
 from . import atlas, config
-from .convert import html_to_adf, html_to_wiki, sanitize_html
+from .convert import adf_to_text, html_to_adf, html_to_wiki, sanitize_html
 
 DEFAULT_JQL = "assignee = currentUser() ORDER BY updated DESC"
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+# fields the detail view renders structurally; everything else lands in attributes
+STRUCT_FIELDS = {"summary", "status", "issuetype", "assignee", "reporter",
+                 "description", "comment", "attachment", "issuelinks",
+                 "subtasks", "watches", "votes", "timetracking", "worklog",
+                 "project", "parent", "created", "updated", "resolutiondate",
+                 "lastViewed", "progress", "aggregateprogress", "workratio",
+                 "issuerestriction", "security"}
+
+# friendly name -> Jira edit payload builder (PUT /issue fields)
+_EDIT_VAL = {
+    "priority": lambda v: {"name": str(v)},
+    "duedate": lambda v: str(v)[:10],
+    "labels": lambda v: [x.strip() for x in
+                         (v if isinstance(v, list) else str(v).split(","))
+                         if x.strip()],
+    "components": lambda v: [{"name": x.strip()} for x in
+                             (v if isinstance(v, list) else str(v).split(","))
+                             if x.strip()],
+    "fixversions": lambda v: [{"name": x.strip()} for x in
+                              (v if isinstance(v, list) else str(v).split(","))
+                              if x.strip()],
+    "environment": lambda v: str(v),
+    "summary": lambda v: str(v),
+}
+
 
 def _display(person):
     return (person or {}).get("displayName")
+
+
+def _ver(client):
+    return "3" if getattr(client, "cloud", False) else "2"
 
 
 def _page_brief(p):
@@ -30,33 +61,51 @@ def _page_brief(p):
             or last_mod}
 
 
-ATTR_STD = {"priority", "created", "duedate", "labels", "components",
-            "fixversions", "resolution"}
-ATTR_PAT = ("sprint", "story point", "epic link", "epic name",
-            "team", "target start", "target end")
+# ---------- generic field -> text ----------
 
-
-def _norm(n):
-    return re.sub(r"[^a-z0-9]", "", (n or "").lower())
-
-
-def _attr_val(v, sprint=False):
-    if v is None or v == "" or v == []:
+def _field_text(v, depth=0):
+    if v is None or v == "" or v == [] or depth > 4:
         return None
-    if isinstance(v, list):
-        parts = [_attr_val(i, sprint) for i in v]
-        return ", ".join(p for p in parts if p) or None
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, (int, float)):
+        return str(int(v)) if float(v).is_integer() else str(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        if s.startswith("com.atlassian.greenhopper") or "Sprint@" in s[:60]:
+            m = re.search(r"name=([^,\]]+)", s)
+            return m.group(1) if m else s[:120]
+        if s.startswith("{") and '"type"' in s[:40]:
+            try:
+                return adf_to_text(json.loads(s)) or s[:120]
+            except Exception:
+                return s[:120]
+        return s if len(s) <= 240 else s[:237] + "..."
     if isinstance(v, dict):
-        for k in ("name", "value", "displayName", "key"):
+        if v.get("type") and "content" in v:  # ADF node
+            return adf_to_text(v) or None
+        for k in ("name", "value", "displayName", "key", "summary", "title"):
             if v.get(k):
-                return str(v[k])
-        return None
-    if isinstance(v, str) and sprint:
-        m = re.search(r"name=([^,\]]+)", v)  # greenhopper "Sprint@…[…,name=X,…]"
-        return m.group(1) if m else v
-    if isinstance(v, float) and v.is_integer():
-        return str(int(v))
-    return str(v)
+                return _field_text(v[k], depth + 1)
+        parts = [_field_text(x, depth + 1) for x in v.values()]
+        joined = ", ".join(p for p in parts if p)
+        return joined[:240] or None
+    if isinstance(v, list):
+        parts = []
+        for i in v:
+            t = _field_text(i, depth + 1)
+            if t and t not in parts:
+                parts.append(t)
+        joined = ", ".join(parts)
+        return joined[:240] or None
+    return str(v)[:240]
+
+
+_FIELD_LABELS = {"duedate": "Due Date", "fixVersions": "Fix Versions",
+                 "components": "Components", "priority": "Priority",
+                 "labels": "Labels", "environment": "Environment"}
 
 
 def _issue_attrs(client, fields):
@@ -66,14 +115,75 @@ def _issue_attrs(client, fields):
         names = {}
     out = []
     for fid, val in fields.items():
-        label = names.get(fid) or fid
-        low = label.lower()
-        if _norm(label) not in ATTR_STD and not any(p in low for p in ATTR_PAT):
+        if fid in STRUCT_FIELDS:
             continue
-        v = _attr_val(val, sprint="sprint" in low)
+        label = names.get(fid) or _FIELD_LABELS.get(fid) or fid
+        v = _field_text(val)
         if v:
             out.append({"name": label, "value": v})
     return out
+
+
+def _attachments_meta(attachments):
+    out = []
+    for a in attachments or []:
+        out.append({
+            "id": str(a.get("id")),
+            "filename": a.get("filename") or a.get("name"),
+            "size": a.get("size") or a.get("fileSize"),
+            "mime": a.get("mimeType") or (a.get("metadata") or {}).get("mediaType"),
+            "created": a.get("created"),
+            "author": _display(a.get("author")),
+        })
+    return out
+
+
+def _issue_links(fields):
+    out = []
+    for l in fields.get("issuelinks") or []:
+        t = l.get("type") or {}
+        for side, key in (("outward", "outwardIssue"), ("inward", "inwardIssue")):
+            other = l.get(key)
+            if not other:
+                continue
+            of = other.get("fields") or {}
+            out.append({"id": str(l.get("id")), "type": t.get("name"),
+                        "direction": side,
+                        "desc": t.get(side) or t.get("name"),
+                        "key": other.get("key"),
+                        "summary": of.get("summary"),
+                        "status": (of.get("status") or {}).get("name")})
+    return out
+
+
+def _epic_key(client, fields):
+    parent = fields.get("parent")
+    if parent:
+        return parent.get("key")
+    try:
+        names = client.field_names()
+    except Exception:
+        names = {}
+    for fid, val in fields.items():
+        if "epic link" in (names.get(fid) or "").lower():
+            v = _field_text(val)
+            if v:
+                return v.split(",")[0].strip()
+    return None
+
+
+def _sprint_points(client, fields):
+    try:
+        names = client.field_names()
+    except Exception:
+        names = {}
+    pts = None
+    for fid, val in fields.items():
+        if "story point" in (names.get(fid) or "").lower() \
+                or "story point" in fid.lower():
+            pts = _field_text(val)
+            break
+    return pts
 
 
 def create_app():
@@ -112,6 +222,35 @@ def create_app():
     def body():
         return request.get_json(force=True, silent=True) or {}
 
+    def cache_get(key):
+        c = getattr(holder["client"], "cache", None)
+        return c.get(key) if c else None
+
+    def cache_set(key, val, ttl=60):
+        c = getattr(holder["client"], "cache", None)
+        if c:
+            c.set(key, val, ttl)
+
+    def cache_wrap(key, ttl, fn):
+        hit = cache_get(key)
+        if hit is not None:
+            return hit
+        val = fn()
+        cache_set(key, val, ttl)
+        return val
+
+    def invalidate():
+        c = getattr(holder["client"], "cache", None)
+        if c:
+            c.clear()
+
+    def binary(data, filename, mime):
+        return Response(data, mimetype=mime or "application/octet-stream",
+                        headers={"Content-Disposition":
+                                 f"attachment; filename*=UTF-8''{quote(filename or 'file')}"})
+
+    # ---------- health / config ----------
+
     @app.get("/api/health")
     def health():
         cfg = config.load_config()
@@ -143,31 +282,36 @@ def create_app():
     @app.get("/api/jira/projects")
     @api
     def jira_projects():
-        return [{"key": p.get("key"), "name": p.get("name")}
-                for p in (holder["client"].jira.projects() or [])]
+        return cache_wrap("jira:projects", 300, lambda: [
+            {"key": p.get("key"), "name": p.get("name")}
+            for p in (holder["client"].jira.projects() or [])])
 
     @app.get("/api/jira/issues")
     @api
     def jira_issues():
         jql = request.args.get("jql") or DEFAULT_JQL
         limit = request.args.get("limit", type=int)
-        data = holder["client"].jira.jql(jql, fields="*all", limit=limit) or {}
-        issues = []
-        for i in data.get("issues", []):
-            f = i.get("fields") or {}
-            issues.append({
-                "key": i.get("key"),
-                "summary": f.get("summary"),
-                "status": (f.get("status") or {}).get("name"),
-                "issuetype": (f.get("issuetype") or {}).get("name"),
-                "assignee": _display(f.get("assignee")),
-                "updated": f.get("updated"),
-            })
-        return {"jql": jql, "issues": issues}
+        key = f"jira:issues:{jql}:{limit}"
 
-    @app.get("/api/jira/issue/<key>")
-    @api
-    def jira_issue(key):
+        def fetch():
+            data = holder["client"].jira.jql(jql, fields="*all", limit=limit) or {}
+            issues = []
+            for i in data.get("issues", []):
+                f = i.get("fields") or {}
+                issues.append({
+                    "key": i.get("key"),
+                    "summary": f.get("summary"),
+                    "status": (f.get("status") or {}).get("name"),
+                    "issuetype": (f.get("issuetype") or {}).get("name"),
+                    "assignee": _display(f.get("assignee")),
+                    "priority": (f.get("priority") or {}).get("name"),
+                    "updated": f.get("updated"),
+                })
+            return {"jql": jql, "issues": issues}
+
+        return cache_wrap(key, 30, fetch)
+
+    def _issue_detail(key):
         c = holder["client"]
         issue = c.jira.issue(key, fields="*all", expand="renderedFields") or {}
         f = issue.get("fields") or {}
@@ -176,21 +320,100 @@ def create_app():
                      "created": cm.get("created"),
                      "body_html": cm.get("body") or ""}
                     for cm in (rf.get("comment") or {}).get("comments", [])]
-        transitions = [{"id": t.get("id"), "name": t.get("name")}
+        transitions = [{"id": t.get("id"), "name": t.get("name"),
+                        "to": ((t.get("to") or {}).get("name"))}
                        for t in (c.jira.get_issue_transitions(key) or [])]
+        itype = (f.get("issuetype") or {}).get("name") or ""
+        epic = _epic_key(c, f)
+        children = None
+        if itype.lower() == "epic":
+            try:
+                data = c.jira.jql(f'parent = {key} ORDER BY key',
+                                  fields="summary,status", limit=100) or {}
+                children = [{"key": i.get("key"),
+                             "summary": (i.get("fields") or {}).get("summary"),
+                             "status": (((i.get("fields") or {}).get("status") or {})
+                                        .get("name"))}
+                            for i in data.get("issues", [])]
+            except Exception:
+                children = None  # some servers reject parent= on epics; degrade quietly
+        atts = []
+        for a in f.get("attachment") or []:
+            aid = a.get("id")
+            atts.append({**_attachments_meta([a])[0],
+                         "url": f"/api/jira/attachment/{aid}"})
         return {
             "key": issue.get("key") or key,
             "summary": f.get("summary"),
-            "status": (f.get("status") or {}).get("name"),
-            "issuetype": (f.get("issuetype") or {}).get("name"),
-            "assignee": _display(f.get("assignee")),
-            "reporter": _display(f.get("reporter")),
+            "status": f.get("status"),
+            "issuetype": f.get("issuetype"),
+            "priority": f.get("priority"),
+            "assignee": f.get("assignee"),
+            "reporter": f.get("reporter"),
+            "created": f.get("created"),
             "updated": f.get("updated"),
+            "duedate": f.get("duedate"),
+            "labels": f.get("labels") or [],
+            "components": [x.get("name") for x in f.get("components") or []],
+            "fixVersions": [x.get("name") for x in f.get("fixVersions") or []],
             "description_html": rf.get("description") or "",
             "comments": comments,
             "transitions": transitions,
             "attributes": _issue_attrs(c, f),
+            "attachments": atts,
+            "links": _issue_links(f),
+            "subtasks": [{"key": s.get("key"),
+                          "summary": (s.get("fields") or {}).get("summary"),
+                          "status": (((s.get("fields") or {}).get("status") or {})
+                                     .get("name"))}
+                         for s in f.get("subtasks") or []],
+            "parent": ({"key": f["parent"].get("key"),
+                        "summary": (f["parent"].get("fields") or {}).get("summary")}
+                       if f.get("parent") else None),
+            "epic": epic,
+            "children": children,
+            "watches": f.get("watches"),
+            "votes": f.get("votes"),
+            "timetracking": f.get("timetracking"),
         }
+
+    @app.get("/api/jira/issue/<key>")
+    @api
+    def jira_issue(key):
+        return cache_wrap(f"jira:issue:{key}", 60,
+                          lambda: _issue_detail(key))
+
+    @app.get("/api/jira/issue/<key>/editmeta")
+    @api
+    def jira_editmeta(key):
+        ver = _ver(holder["client"])
+        meta = holder["client"].jira.get(
+            f"rest/api/{ver}/issue/{key}/editmeta") or {}
+        fields = {}
+        for fid, fm in (meta.get("fields") or {}).items():
+            av = fm.get("allowedValues")
+            fields[fid] = {
+                "name": fm.get("name"),
+                "required": fm.get("required"),
+                "allowedValues": [
+                    v if isinstance(v, dict) else {"value": v}
+                    for v in (av or [])
+                ][:50] if av else [],
+            }
+        return {"fields": fields}
+
+    @app.get("/api/jira/users")
+    @api
+    def jira_users():
+        q = request.args.get("q") or ""
+        ver = _ver(holder["client"])
+        users = holder["client"].jira.get(
+            f"rest/api/{ver}/user/search",
+            params={"query": q, "maxResults": 15}) or []
+        return [{"accountId": u.get("accountId"), "name": u.get("name"),
+                 "displayName": u.get("displayName"),
+                 "email": u.get("emailAddress")}
+                for u in users if isinstance(u, dict)]
 
     def _jira_write_fields(b):
         html = sanitize_html(b.get("description_html") or "")
@@ -210,7 +433,33 @@ def create_app():
             res = c.jira.post("rest/api/3/issue", data={"fields": fields}) or {}
         else:
             res = c.jira.issue_create(fields) or {}
+        invalidate()
         return {"key": res.get("key")}
+
+    _EDIT_ID = {"priority": "priority", "duedate": "duedate", "labels": "labels",
+                "components": "components", "fixversions": "fixVersions",
+                "environment": "environment", "summary": "summary"}
+
+    def _edit_fields(b):
+        """Translate friendly field edits into a Jira fields payload."""
+        out = {}
+        raw = b.get("fields") or {}
+        if not isinstance(raw, dict):
+            return out
+        for k, v in raw.items():
+            kl = k.lower().replace(" ", "")
+            if kl == "assignee":
+                if isinstance(v, dict):
+                    out["assignee"] = ({"accountId": v["accountId"]}
+                                       if v.get("accountId") else
+                                       {"name": v.get("name") or v.get("displayName")})
+                elif v:
+                    out["assignee"] = {"name": str(v)}
+                continue
+            builder = _EDIT_VAL.get(kl)
+            if builder is not None:
+                out[_EDIT_ID[kl]] = builder(v)
+        return out
 
     @app.put("/api/jira/issue/<key>")
     @api
@@ -222,6 +471,7 @@ def create_app():
             fields["summary"] = b["summary"]
         if "description_html" in b:
             fields.update(_jira_write_fields(b))
+        fields.update(_edit_fields(b))
         if fields:
             if holder["cfg"]["cloud"]:
                 c.jira.put(f"rest/api/3/issue/{key}", data={"fields": fields})
@@ -229,6 +479,7 @@ def create_app():
                 c.jira.issue_update(key, fields)
         if b.get("transition_id") not in (None, ""):
             c.jira.set_issue_status_by_transition_id(key, b["transition_id"])
+        invalidate()
         return {"ok": True}
 
     @app.post("/api/jira/issue/<key>/comment")
@@ -241,32 +492,216 @@ def create_app():
                         data={"body": html_to_adf(html)})
         else:
             c.jira.issue_add_comment(key, html_to_wiki(html))
+        invalidate()
         return {"ok": True}
 
     @app.delete("/api/jira/issue/<key>")
     @api
     def jira_issue_delete(key):
         holder["client"].jira.delete_issue(key)
+        invalidate()
         return {"ok": True}
+
+    @app.post("/api/jira/transition")
+    @api
+    def jira_bulk_transition():
+        b = body()
+        keys = b.get("keys") or []
+        tid = b.get("transition_id")
+        if not keys or not tid:
+            return jsonify(error="keys and transition_id required"), 400
+        errors = []
+        for k in keys:
+            try:
+                holder["client"].jira.set_issue_status_by_transition_id(k, tid)
+            except Exception as e:
+                errors.append({"key": k, "error": str(e)})
+        invalidate()
+        return {"ok": not errors, "errors": errors}
+
+    # ---------- watchers / votes / links ----------
+
+    @app.get("/api/jira/issue/<key>/watchers")
+    @api
+    def jira_watchers(key):
+        ver = _ver(holder["client"])
+        return holder["client"].jira.get(
+            f"rest/api/{ver}/issue/{key}/watchers") or {}
+
+    @app.post("/api/jira/issue/<key>/watchers")
+    @api
+    def jira_watch(key):
+        ver = _ver(holder["client"])
+        b = body()
+        data = {}
+        if b.get("accountId"):
+            data["accountId"] = b["accountId"]
+        elif b.get("name"):
+            data["name"] = b["name"]
+        holder["client"].jira.post(
+            f"rest/api/{ver}/issue/{key}/watchers", data=data)
+        invalidate()
+        return {"ok": True}
+
+    @app.delete("/api/jira/issue/<key>/watchers")
+    @api
+    def jira_unwatch(key):
+        ver = _ver(holder["client"])
+        aid = request.args.get("accountId") or ""
+        path = f"rest/api/{ver}/issue/{key}/watchers"
+        if aid:
+            path += f"?accountId={aid}"
+        holder["client"].jira.delete(path)
+        invalidate()
+        return {"ok": True}
+
+    @app.post("/api/jira/issue/<key>/vote")
+    @api
+    def jira_vote(key):
+        ver = _ver(holder["client"])
+        holder["client"].jira.post(f"rest/api/{ver}/issue/{key}/votes",
+                                   data={})
+        invalidate()
+        return {"ok": True}
+
+    @app.get("/api/jira/issue/<key>/linktypes")
+    @api
+    def jira_linktypes(key):
+        return cache_wrap("jira:linktypes", 300, lambda: [
+            {"id": t.get("id"), "name": t.get("name"),
+             "inward": t.get("inward"), "outward": t.get("outward")}
+            for t in (holder["client"].jira.get_issue_link_types() or [])])
+
+    @app.post("/api/jira/issue/<key>/link")
+    @api
+    def jira_link_add(key):
+        b = body()
+        other = b.get("other") or b.get("key")
+        if b.get("inwardIssue") and b.get("outwardIssue"):
+            inward, outward = b["inwardIssue"], b["outwardIssue"]
+        elif b.get("direction") == "outward":
+            # this issue carries the outward description (e.g. "blocks")
+            inward, outward = other, key
+        else:
+            inward, outward = key, other
+        if not inward or not outward:
+            return jsonify(error="other issue key required"), 400
+        holder["client"].jira.create_issue_link({
+            "type": {"name": b["type"]},
+            "inwardIssue": {"key": inward},
+            "outwardIssue": {"key": outward}})
+        invalidate()
+        return {"ok": True}
+
+    @app.delete("/api/jira/issue/<key>/link/<link_id>")
+    @api
+    def jira_link_del(key, link_id):
+        ver = _ver(holder["client"])
+        holder["client"].jira.delete(f"rest/api/{ver}/issueLink/{link_id}")
+        invalidate()
+        return {"ok": True}
+
+    # ---------- attachments (Jira) ----------
+
+    @app.get("/api/jira/attachment/<aid>")
+    @api
+    def jira_attachment(aid):
+        c = holder["client"]
+        ver = _ver(c)
+        meta = c.jira.get(f"rest/api/{ver}/attachment/{aid}") or {}
+        content = meta.get("content") or ""
+        base = holder["cfg"]["url"]
+        if content.startswith(base):
+            content = content[len(base):]
+        path = content if content.startswith("/") else \
+            f"rest/api/{ver}/attachment/content/{aid}"
+        data = c.jira.get(path, not_json_response=True)
+        if isinstance(data, (dict, list)):
+            data = json.dumps(data).encode()
+        return binary(data, meta.get("filename") or f"att-{aid}",
+                      meta.get("mimeType"))
+
+    @app.post("/api/jira/issue/<key>/attachment")
+    @api
+    def jira_attachment_upload(key):
+        f = request.files.get("file")
+        if not f or not f.filename:
+            return jsonify(error="no file"), 400
+        holder["client"].jira.add_attachment_object(
+            key, io.BytesIO(f.read()))
+        invalidate()
+        return {"ok": True}
+
+    # ---------- agile (boards / sprints) ----------
+
+    @app.get("/api/jira/boards")
+    @api
+    def jira_boards():
+        project = request.args.get("project") or ""
+        key = f"jira:boards:{project}"
+
+        def fetch():
+            data = holder["client"].jira.get_all_agile_boards(
+                project_key=project or None, limit=50) or {}
+            return [{"id": b.get("id"), "name": b.get("name"),
+                     "type": b.get("type"),
+                     "project": ((b.get("location") or {}).get("projectKey"))}
+                    for b in data.get("values", data.get("results", []))]
+
+        return cache_wrap(key, 120, fetch)
+
+    @app.get("/api/jira/boards/<bid>/sprints")
+    @api
+    def jira_board_sprints(bid):
+        state = request.args.get("state") or None
+        data = holder["client"].jira.get_all_sprints_from_board(
+            bid, state=state, limit=50) or {}
+        return cache_wrap(f"jira:sprints:{bid}:{state}", 60, lambda: [
+            {"id": s.get("id"), "name": s.get("name"), "state": s.get("state"),
+             "startDate": s.get("startDate"), "endDate": s.get("endDate"),
+             "goal": s.get("goal")}
+            for s in data.get("values", data.get("results", []))])
+
+    @app.get("/api/jira/sprints/<sid>/issues")
+    @api
+    def jira_sprint_issues(sid):
+        c = holder["client"]
+        data = c.jira.get_sprint_issues(sid, 0, 200) or {}
+        return cache_wrap(f"jira:sprintissues:{sid}", 30, lambda: [
+            _sprint_card(i) for i in data.get("issues", [])])
+
+    def _sprint_card(i):
+        f = i.get("fields") or {}
+        return {"key": i.get("key"), "summary": f.get("summary"),
+                "status": (f.get("status") or {}).get("name"),
+                "status_id": (f.get("status") or {}).get("id"),
+                "issuetype": (f.get("issuetype") or {}).get("name"),
+                "assignee": _display(f.get("assignee")),
+                "priority": (f.get("priority") or {}).get("name"),
+                "points": _sprint_points(holder["client"], f),
+                "epic": _epic_key(holder["client"], f),
+                "updated": f.get("updated")}
 
     # ---------- Confluence ----------
 
     @app.get("/api/confluence/spaces")
     @api
     def conf_spaces():
-        c = holder["client"].conf
-        spaces, start = [], 0
-        while True:  # get_all_spaces doesn't paginate; loop to a short page
-            page = (c.get_all_spaces(start=start, limit=100) or {}
-                    ).get("results", [])
-            spaces += page
-            if len(page) < 100:
-                break
-            start += 100
-        spaces.sort(key=lambda s: (s.get("type") == "personal",
-                                   (s.get("name") or "").lower()))
-        return [{"key": s.get("key"), "name": s.get("name")}
-                for s in spaces]
+        def fetch():
+            c = holder["client"].conf
+            spaces, start = [], 0
+            while True:  # get_all_spaces doesn't paginate; loop to a short page
+                page = (c.get_all_spaces(start=start, limit=100) or {}
+                        ).get("results", [])
+                spaces += page
+                if len(page) < 100:
+                    break
+                start += 100
+            spaces.sort(key=lambda s: (s.get("type") == "personal",
+                                       (s.get("name") or "").lower()))
+            return [{"key": s.get("key"), "name": s.get("name")}
+                    for s in spaces]
+        return cache_wrap("conf:spaces", 300, fetch)
 
     @app.get("/api/confluence/pages")
     @api
@@ -275,26 +710,71 @@ def create_app():
         space = re.sub(r"[^A-Za-z0-9_]", "", request.args.get("space") or "")
         q = (request.args.get("q") or "").replace('"', "")
         limit = request.args.get("limit", type=int) or 50
-        if q:
-            cql = f'type=page AND title~"{q}"'
-            if space:
-                cql += f' AND space="{space}"'
-            data = c.cql(cql, limit=limit) or {}
-            raw = data.get("results", [])
-        elif space:
-            raw = c.get_all_pages_from_space(space, limit=limit) or []
-        else:
-            # shortcut: "all spaces" isn't a get_all_pages_from_space call;
-            # CQL is the only way to list pages across spaces.
-            raw = (c.cql("type=page", limit=limit) or {}).get("results", [])
-        return {"pages": [_page_brief(p) for p in raw]}
+        key = f"conf:pages:{space}:{q}:{limit}"
 
-    @app.get("/api/confluence/page/<page_id>")
+        def fetch():
+            if q:
+                cql = f'type=page AND title~"{q}"'
+                if space:
+                    cql += f' AND space="{space}"'
+                data = c.cql(cql, limit=limit) or {}
+                raw = data.get("results", [])
+            elif space:
+                raw = c.get_all_pages_from_space(space, limit=limit) or []
+            else:
+                # shortcut: "all spaces" isn't a get_all_pages_from_space call;
+                # CQL is the only way to list pages across spaces.
+                raw = (c.cql("type=page", limit=limit) or {}).get("results", [])
+            return {"pages": [_page_brief(p) for p in raw]}
+
+        return cache_wrap(key, 30, fetch)
+
+    @app.get("/api/confluence/cql")
     @api
-    def conf_page(page_id):
-        p = holder["client"].conf.get_page_by_id(
-            page_id, expand="body.view,version,space") or {}
+    def conf_cql():
+        cql = request.args.get("cql") or ""
+        if not cql.strip():
+            return jsonify(error="cql required"), 400
+        limit = request.args.get("limit", type=int) or 50
+        data = holder["client"].conf.cql(cql, limit=limit) or {}
+        return {"pages": [_page_brief(p) for p in data.get("results", [])]}
+
+    def _conf_page_detail(page_id):
+        c = holder["client"].conf
+        p = c.get_page_by_id(page_id, expand="body.view,version,space") or {}
         space = p.get("space") or {}
+        ancestors, children, labels, atts = [], [], [], []
+        try:
+            ancestors = [{"id": str(a.get("id")), "title": a.get("title")}
+                         for a in (c.get_page_ancestors(page_id) or [])]
+        except Exception:
+            pass
+        try:
+            children = [{"id": str(ch.get("id")), "title": ch.get("title")}
+                        for ch in (c.get_child_pages(page_id) or [])
+                        if ch.get("type", "page") == "page"]
+        except Exception:
+            pass
+        try:
+            labels = [r.get("name") for r in
+                      ((c.get_page_labels(page_id) or {}).get("results") or [])]
+        except Exception:
+            pass
+        try:
+            res = c.get_attachments_from_content(page_id, limit=100) or {}
+            for a in res.get("results", []):
+                dl = ((a.get("_links") or {}).get("download")) or ""
+                atts.append({
+                    "id": str(a.get("id")),
+                    "filename": a.get("title"),
+                    "mime": (a.get("metadata") or {}).get("mediaType"),
+                    "size": (a.get("extensions") or {}).get("fileSize"),
+                    "version": (a.get("version") or {}).get("number"),
+                    "url": "/api/confluence/attachment?dl=" + quote(dl, safe="")
+                    if dl else None,
+                })
+        except Exception:
+            pass
         return {
             "id": str(p.get("id")),
             "title": p.get("title"),
@@ -302,7 +782,64 @@ def create_app():
             "space_name": space.get("name"),
             "version": (p.get("version") or {}).get("number"),
             "body_html": ((p.get("body") or {}).get("view") or {}).get("value") or "",
+            "ancestors": ancestors,
+            "children": children,
+            "labels": labels,
+            "attachments": atts,
         }
+
+    @app.get("/api/confluence/page/<page_id>")
+    @api
+    def conf_page(page_id):
+        return cache_wrap(f"conf:page:{page_id}", 60,
+                          lambda: _conf_page_detail(page_id))
+
+    @app.get("/api/confluence/page/<page_id>/history")
+    @api
+    def conf_page_history(page_id):
+        c = holder["client"].conf
+        data = c.get(f"rest/api/content/{page_id}/version?limit=25") or {}
+        return cache_wrap(f"conf:history:{page_id}", 120, lambda: [
+            {"number": v.get("number"), "when": v.get("when"),
+             "by": _display(v.get("by")), "message": v.get("message")}
+            for v in data.get("results", [])])
+
+    @app.get("/api/confluence/attachment")
+    @api
+    def conf_attachment():
+        dl = request.args.get("dl") or ""
+        if not dl.startswith("/download/"):
+            return jsonify(error="bad attachment path"), 400
+        c = holder["client"].conf
+        data = c.get(dl, not_json_response=True)
+        if isinstance(data, (dict, list)):
+            data = json.dumps(data).encode()
+        name = dl.split("/")[-1].split("?")[0] or "file"
+        mime = "application/octet-stream"
+        for ext, m in ((".png", "image/png"), (".jpg", "image/jpeg"),
+                       (".jpeg", "image/jpeg"), (".gif", "image/gif"),
+                       (".svg", "image/svg+xml"), (".webp", "image/webp"),
+                       (".pdf", "application/pdf")):
+            if name.lower().endswith(ext):
+                mime = m
+                break
+        # images render inline in the pane; everything else downloads
+        disp = "inline" if mime.startswith("image/") else "attachment"
+        return Response(data, mimetype=mime, headers={
+            "Content-Disposition": f'{disp}; filename*=UTF-8\'\'{quote(name)}'})
+
+    @app.post("/api/confluence/page/<page_id>/attachment")
+    @api
+    def conf_attachment_upload(page_id):
+        f = request.files.get("file")
+        if not f or not f.filename:
+            return jsonify(error="no file"), 400
+        holder["client"].conf.attach_content(
+            f.read(), f.filename,
+            content_type=f.mimetype or "application/binary",
+            page_id=page_id)
+        invalidate()
+        return {"ok": True}
 
     @app.post("/api/confluence/page")
     @api
@@ -311,6 +848,7 @@ def create_app():
         res = holder["client"].conf.create_page(
             b["space"], b["title"], sanitize_html(b.get("body_html") or ""),
             parent_id=b.get("parent_id") or None, representation="storage") or {}
+        invalidate()
         return {"id": str(res.get("id"))}
 
     @app.put("/api/confluence/page/<page_id>")
@@ -319,12 +857,14 @@ def create_app():
         b = body()
         holder["client"].conf.update_page(
             page_id, b["title"], sanitize_html(b.get("body_html") or ""))
+        invalidate()
         return {"ok": True}
 
     @app.delete("/api/confluence/page/<page_id>")
     @api
     def conf_page_delete(page_id):
         holder["client"].conf.remove_page(page_id)
+        invalidate()
         return {"ok": True}
 
     @app.get("/")

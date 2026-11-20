@@ -112,8 +112,9 @@ body.setup-mode #gutter { display: none; }
 
 /* ---- Rows ---- */
 .row {
-  padding: 8px 12px; border-bottom: 1px solid var(--border);
-  cursor: pointer; display: flex; gap: 10px; align-items: baseline;
+  height: 36px; padding: 0 12px; border-bottom: 1px solid var(--border);
+  cursor: pointer; display: flex; gap: 10px; align-items: center;
+  overflow: hidden;
 }
 .row:hover { background: rgba(84,232,255,.06); }
 .row.sel { background: rgba(84,232,255,.12); border-left: 3px solid var(--cyan); }
@@ -146,6 +147,42 @@ a { color: var(--cyan); }
 .detail-body-html th,.detail-body-html td { border: 1px solid var(--border); padding: 4px 8px; }
 .comment { border: 1px solid var(--border); padding: 8px 10px; margin: 8px 0; background: rgba(11,18,12,.6); }
 .comment .who { color: var(--cyan); font-size: 11px; margin-bottom: 4px; }
+
+/* ---- attachments / links / chips / crumbs ---- */
+.att-row { display: flex; align-items: baseline; gap: 10px; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.att-row a { color: var(--cyan); }
+.att-meta { color: var(--dim); font-size: 11px; }
+.att-img { display: block; max-width: 100%; border: 1px solid var(--border); margin: 8px 0; image-rendering: auto; }
+.link-row { display: flex; gap: 10px; align-items: baseline; padding: 3px 0; border-bottom: 1px dashed var(--border); font-size: 13px; }
+.link-desc { color: var(--amber); font-size: 11px; text-transform: uppercase; min-width: 90px; }
+.link-key { color: var(--cyan); cursor: pointer; flex-shrink: 0; }
+.link-sum { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.link-add { display: flex; gap: 6px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
+.link-add input, .link-add select {
+  background: var(--bg); color: var(--fg); border: 2px solid var(--border);
+  font-family: var(--mono); font-size: 12px; padding: 4px 6px;
+}
+.link-add input { flex: 1; min-width: 120px; }
+.link-add input:focus, .link-add select:focus { outline: none; border-color: var(--cyan); }
+.chip { display: inline-block; border: 1px solid var(--border); color: var(--cyan);
+  font-size: 11px; padding: 1px 7px; margin-right: 4px; }
+.chips-row { margin-top: 6px; }
+.crumbs { color: var(--dim); font-size: 11px; margin-top: 6px; }
+.crumb { color: var(--cyan); cursor: pointer; }
+.crumb:hover { color: var(--amber); }
+
+/* ---- sprint board ---- */
+.board { display: flex; gap: 10px; align-items: flex-start; overflow-x: auto; padding-bottom: 12px; }
+.board-col { min-width: 230px; max-width: 280px; flex: 1; border: 2px solid var(--border); background: var(--panel); }
+.board-col-head { padding: 6px 10px; border-bottom: 2px solid var(--border); color: var(--amber);
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+.board-count { color: var(--cyan); }
+.bcard { border-bottom: 1px solid var(--border); padding: 7px 10px; cursor: pointer; }
+.bcard:hover { background: rgba(84,232,255,.06); }
+.bcard.sel { background: rgba(84,232,255,.12); border-left: 3px solid var(--cyan); }
+.bcard-key { color: var(--amber); font-size: 12px; }
+.bcard-sum { font-size: 13px; margin: 2px 0; overflow-wrap: break-word; }
+.bcard-meta { color: var(--dim); font-size: 11px; }
 
 .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
 button.act {

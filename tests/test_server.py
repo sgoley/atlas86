@@ -1,5 +1,7 @@
+import io
 import os
 import stat
+from urllib.parse import quote
 
 import pytest
 
@@ -10,6 +12,7 @@ from atlas86 import config, server
 class FakeJira:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.calls = []
 
     def projects(self):
         return [{"key": "T", "name": "Test"}]
@@ -30,6 +33,21 @@ class FakeJira:
                 "fields": {"summary": "s",
                            "priority": {"name": "High"},
                            "labels": ["a", "b"],
+                           "duedate": "2026-02-01",
+                           "components": [{"name": "Core"}],
+                           "fixVersions": [{"name": "v1"}],
+                           "attachment": [{"id": "9", "filename": "f.png",
+                                           "mimeType": "image/png", "size": 3}],
+                           "issuelinks": [{"id": "55", "type": {"name": "Blocks"},
+                                           "outwardIssue": {"key": "T-2",
+                                                            "fields": {"summary": "other",
+                                                                       "status": {"name": "Open"}}}}],
+                           "subtasks": [{"key": "T-1a", "fields": {"summary": "sub",
+                                                                   "status": {"name": "Done"}}}],
+                           "parent": {"key": "T-9", "fields": {"summary": "epic"}},
+                           "watches": {"watchCount": 2, "isWatching": True},
+                           "votes": {"votes": 3, "hasVoted": False},
+                           "timetracking": {"timeSpent": "1h"},
                            "customfield_10016": 5.0,
                            "customfield_10020": [
                                "com.atlassian.Sprint@1[id=9,name=Sprint 42,state=ACTIVE]"]},
@@ -38,28 +56,131 @@ class FakeJira:
                                        {"author": {"displayName": "Bo"},
                                         "created": "c", "body": "<p>hi</p>"}]}}}
 
+    def get(self, path, **kw):
+        self.calls.append(("GET", path, kw))
+        if "editmeta" in path:
+            return {"fields": {"priority": {"name": "Priority", "required": False,
+                                            "allowedValues": [{"name": "High"},
+                                                              {"name": "Low"}]},
+                               "duedate": {"name": "Due Date"}}}
+        if "user/search" in path:
+            return [{"accountId": "acc1", "displayName": "Ann",
+                     "name": "ann", "emailAddress": "a@x.com"}]
+        if "/attachment/9" in path and "content" not in path:
+            return {"id": "9", "filename": "f.png", "mimeType": "image/png",
+                    "content": "/rest/api/2/attachment/content/9"}
+        return {}
+
+    def post(self, path, data=None, **kw):
+        self.calls.append(("POST", path, data))
+        return {}
+
+    def put(self, path, data=None, **kw):
+        self.calls.append(("PUT", path, data))
+        return {}
+
+    def delete(self, path, **kw):
+        self.calls.append(("DELETE", path))
+        return {}
+
+    def issue_update(self, key, fields):
+        self.calls.append(("issue_update", key, fields))
+        return {}
+
+    def issue_create(self, fields):
+        self.calls.append(("issue_create", fields))
+        return {"key": "T-100"}
+
+    def delete_issue(self, key):
+        self.calls.append(("delete_issue", key))
+
+    def set_issue_status_by_transition_id(self, key, tid):
+        self.calls.append(("transition", key, tid))
+
     def get_issue_transitions(self, key):
-        return [{"id": "31", "name": "Done"}]
+        return [{"id": "31", "name": "Done", "to": {"name": "Done"}}]
+
+    def get_issue_link_types(self):
+        return [{"id": "10000", "name": "Blocks",
+                 "inward": "is blocked by", "outward": "blocks"}]
+
+    def create_issue_link(self, data):
+        self.calls.append(("link", data))
+        return {}
+
+    def add_attachment_object(self, key, fobj):
+        self.calls.append(("attach", key, fobj.read()))
+        return [{"id": "10"}]
+
+    def get_all_agile_boards(self, **kw):
+        return {"values": [{"id": 1, "name": "Scrum", "type": "scrum",
+                            "location": {"projectKey": "T"}}]}
+
+    def get_all_sprints_from_board(self, bid, **kw):
+        return {"values": [{"id": 7, "name": "Sprint 1", "state": "active"}]}
+
+    def get_sprint_issues(self, sid, start, limit):
+        return {"issues": [{"key": "T-1",
+                            "fields": {"summary": "s",
+                                       "status": {"id": "1", "name": "To Do"},
+                                       "issuetype": {"name": "Story"},
+                                       "assignee": {"displayName": "Ann"},
+                                       "priority": {"name": "High"},
+                                       "customfield_10016": 3.0}}]}
 
 
 class FakeConf:
-    def get_all_spaces(self):
+    def __init__(self):
+        self.calls = []
+
+    def get_all_spaces(self, **kw):
         return {"results": [{"key": "DOC", "name": "Docs"}]}
 
     def get_all_pages_from_space(self, space, limit=50):
         return [{"id": "42", "title": "Page", "space": {"key": space},
                  "version": {"when": "2026-01-02"}}]
 
-    def cql(self, cql, limit=None):
+    def cql(self, cql, **kw):
+        self.calls.append(("cql", cql))
         return {"results": [{"content": {"id": "7", "title": "Hit",
                                         "spaceKey": "DOC"},
                              "lastModified": "2026-01-03"}]}
 
-    def get_page_by_id(self, page_id, expand=None):
+    def get_page_by_id(self, page_id, expand=None, **kw):
         return {"id": int(page_id), "title": "Page",
                 "space": {"key": "DOC", "name": "Docs"},
                 "version": {"number": 3},
                 "body": {"view": {"value": "<p>body</p>"}}}
+
+    def get_page_ancestors(self, page_id):
+        return [{"id": "1", "title": "Root"}, {"id": "2", "title": "Mid"}]
+
+    def get_child_pages(self, page_id):
+        return [{"id": "43", "title": "Child", "type": "page"}]
+
+    def get_page_labels(self, page_id, **kw):
+        return {"results": [{"prefix": "global", "name": "runbook"}]}
+
+    def get_attachments_from_content(self, page_id, **kw):
+        return {"results": [{"id": "5", "title": "doc.pdf",
+                             "metadata": {"mediaType": "application/pdf"},
+                             "extensions": {"fileSize": 10},
+                             "version": {"number": 1},
+                             "_links": {"download":
+                                        "/download/attachments/42/doc.pdf?version=1"}}]}
+
+    def get(self, path, **kw):
+        self.calls.append(("GET", path, kw))
+        if path.startswith("/download/"):
+            return b"%PDF-fake"
+        if "version" in path:
+            return {"results": [{"number": 3, "when": "2026-01-02T00:00:00Z",
+                                 "by": {"displayName": "Ann"}, "message": "edit"}]}
+        return {}
+
+    def attach_content(self, content, name, **kw):
+        self.calls.append(("attach", name, content))
+        return {}
 
 
 class FakeAtlas:
@@ -173,3 +294,138 @@ def test_confluence_page(client):
     assert data["id"] == "42" and data["title"] == "Page"
     assert data["space"] == "DOC" and data["space_name"] == "Docs"
     assert data["version"] == 3 and data["body_html"] == "<p>body</p>"
+
+
+def _configured(client):
+    client.post("/api/config", json={"url": "https://x", "user": "u",
+                                      "cloud": False, "token": "t"})
+
+
+def test_jira_issue_detail_full_fields(client):
+    _configured(client)
+    d = client.get("/api/jira/issue/T-1").get_json()
+    assert d["priority"]["name"] == "High"
+    assert d["labels"] == ["a", "b"]
+    assert d["components"] == ["Core"] and d["fixVersions"] == ["v1"]
+    assert d["duedate"] == "2026-02-01"
+    assert d["epic"] == "T-9"
+    assert d["parent"]["key"] == "T-9"
+    assert d["watches"]["watchCount"] == 2 and d["watches"]["isWatching"] is True
+    assert d["votes"]["votes"] == 3 and d["votes"]["hasVoted"] is False
+    assert d["timetracking"]["timeSpent"] == "1h"
+    assert d["attachments"][0]["filename"] == "f.png"
+    assert d["attachments"][0]["url"] == "/api/jira/attachment/9"
+    assert d["links"][0]["key"] == "T-2" and d["links"][0]["type"] == "Blocks"
+    assert d["subtasks"][0]["key"] == "T-1a"
+    assert d["transitions"][0]["to"] == "Done"
+    attrs = {a["name"]: a["value"] for a in d["attributes"]}
+    assert attrs["Story Points"] == "5" and attrs["Sprint"] == "Sprint 42"
+
+
+def test_jira_field_edit(client):
+    _configured(client)
+    r = client.put("/api/jira/issue/T-1", json={"fields": {
+        "priority": "Low", "duedate": "2026-03-01",
+        "labels": "x, y", "components": "Core, UI",
+        "assignee": {"accountId": "acc1"}}})
+    assert r.get_json() == {"ok": True}
+    cli = FakeAtlas.instances[-1]
+    upd = [c for c in cli.jira.calls if c[0] == "issue_update"]
+    assert upd, "issue_update not called"
+    fields = upd[-1][2]
+    assert fields["priority"] == {"name": "Low"}
+    assert fields["duedate"] == "2026-03-01"
+    assert fields["labels"] == ["x", "y"]
+    assert fields["components"] == [{"name": "Core"}, {"name": "UI"}]
+    assert fields["assignee"] == {"accountId": "acc1"}
+
+
+def test_jira_editmeta_and_users(client):
+    _configured(client)
+    meta = client.get("/api/jira/issue/T-1/editmeta").get_json()
+    assert meta["fields"]["priority"]["allowedValues"][0]["name"] == "High"
+    users = client.get("/api/jira/users?q=an").get_json()
+    assert users[0]["accountId"] == "acc1"
+
+
+def test_jira_watchers_vote_link_delete(client):
+    _configured(client)
+    assert client.post("/api/jira/issue/T-1/watchers",
+                       json={}).get_json() == {"ok": True}
+    assert client.delete("/api/jira/issue/T-1/watchers").get_json() == {"ok": True}
+    assert client.post("/api/jira/issue/T-1/vote",
+                       json={}).get_json() == {"ok": True}
+    types = client.get("/api/jira/issue/T-1/linktypes").get_json()
+    assert types[0]["name"] == "Blocks"
+    assert client.post("/api/jira/issue/T-1/link", json={
+        "type": "Blocks", "other": "T-3",
+        "direction": "outward"}).get_json() == {"ok": True}
+    assert client.delete("/api/jira/issue/T-1/link/55").get_json() == {"ok": True}
+    cli = FakeAtlas.instances[-1]
+    kinds = [c[0] for c in cli.jira.calls]
+    assert "link" in kinds
+    link_call = [c for c in cli.jira.calls if c[0] == "link"][-1]
+    assert link_call[1]["outwardIssue"] == {"key": "T-1"}
+    assert link_call[1]["inwardIssue"] == {"key": "T-3"}
+
+
+def test_jira_attachment_roundtrip(client):
+    _configured(client)
+    r = client.get("/api/jira/attachment/9")
+    assert r.status_code == 200
+    assert r.mimetype == "image/png"
+    assert "f.png" in r.headers["Content-Disposition"]
+    up = client.post("/api/jira/issue/T-1/attachment",
+                     data={"file": (io.BytesIO(b"PNG"), "f.png")},
+                     content_type="multipart/form-data")
+    assert up.get_json() == {"ok": True}
+    cli = FakeAtlas.instances[-1]
+    assert any(c[0] == "attach" and c[1] == "T-1" for c in cli.jira.calls)
+
+
+def test_jira_bulk_transition(client):
+    _configured(client)
+    r = client.post("/api/jira/transition",
+                    json={"keys": ["T-1", "T-2"], "transition_id": "31"})
+    assert r.get_json() == {"ok": True, "errors": []}
+    cli = FakeAtlas.instances[-1]
+    assert sum(1 for c in cli.jira.calls if c[0] == "transition") == 2
+
+
+def test_jira_boards_sprints(client):
+    _configured(client)
+    boards = client.get("/api/jira/boards?project=T").get_json()
+    assert boards[0]["name"] == "Scrum" and boards[0]["id"] == 1
+    sprints = client.get("/api/jira/boards/1/sprints").get_json()
+    assert sprints[0]["name"] == "Sprint 1"
+    issues = client.get("/api/jira/sprints/7/issues").get_json()
+    assert issues[0]["key"] == "T-1" and issues[0]["points"] == "3"
+    assert issues[0]["status"] == "To Do"
+
+
+def test_confluence_page_extras(client):
+    _configured(client)
+    d = client.get("/api/confluence/page/42").get_json()
+    assert d["ancestors"][0]["title"] == "Root"
+    assert d["children"][0]["id"] == "43"
+    assert d["labels"] == ["runbook"]
+    assert d["attachments"][0]["filename"] == "doc.pdf"
+    assert d["attachments"][0]["url"].startswith("/api/confluence/attachment?dl=")
+    hist = client.get("/api/confluence/page/42/history").get_json()
+    assert hist[0]["number"] == 3 and hist[0]["by"] == "Ann"
+
+
+def test_confluence_cql_and_attachment(client):
+    _configured(client)
+    r = client.get("/api/confluence/cql?cql=type%3Dpage")
+    assert r.get_json()["pages"][0]["id"] == "7"
+    dl = quote("/download/attachments/42/doc.pdf?version=1", safe="")
+    r = client.get("/api/confluence/attachment?dl=" + dl)
+    assert r.status_code == 200
+    assert r.get_data() == b"%PDF-fake"
+    bad = client.get("/api/confluence/attachment?dl=/etc/passwd")
+    assert bad.status_code == 400
+    up = client.post("/api/confluence/page/42/attachment",
+                     data={"file": (io.BytesIO(b"PDF"), "doc.pdf")},
+                     content_type="multipart/form-data")
+    assert up.get_json() == {"ok": True}

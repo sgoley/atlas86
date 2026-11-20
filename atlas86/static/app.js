@@ -4,6 +4,8 @@
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const textToHtml = t => esc(t).replace(/\n/g, '<br>');
+const fmtSize = n => n == null ? '' : n > 1048576 ? (n/1048576).toFixed(1)+'M'
+  : n > 1024 ? (n/1024).toFixed(0)+'K' : n + 'B';
 
 function toast(msg, kind = 'info') {
   const t = document.createElement('div');
@@ -32,6 +34,29 @@ async function api(path, opts = {}) {
     throw new Error(msg);
   }
   return data;
+}
+
+/* ============ virtualized list ============ */
+const ROW_H = 36, V_OVERSCAN = 12;
+function vlistRender(box, items, sel, rowHtml, onPick) {
+  // spacer model: top spacer + visible rows; box is the scroll container
+  const ch = box.clientHeight || 600;
+  const start = Math.max(0, Math.floor(box.scrollTop / ROW_H) - V_OVERSCAN);
+  const end = Math.min(items.length,
+    Math.ceil((box.scrollTop + ch) / ROW_H) + V_OVERSCAN);
+  let html = `<div style="height:${start * ROW_H}px"></div>`;
+  for (let i = start; i < end; i++) html += rowHtml(items[i], i);
+  html += `<div style="height:${(items.length - end) * ROW_H}px"></div>`;
+  box.innerHTML = html;
+  box.querySelectorAll('.row').forEach(r => r.addEventListener('click', () => {
+    const i = +r.dataset.i;
+    onPick(i);
+  }));
+}
+function vlistEnsureVisible(box, sel) {
+  const top = sel * ROW_H, ch = box.clientHeight;
+  if (top < box.scrollTop) box.scrollTop = top;
+  else if (top + ROW_H > box.scrollTop + ch) box.scrollTop = top + ROW_H - ch;
 }
 
 /* ============ sound (default OFF) ============ */
@@ -104,8 +129,12 @@ function setConn(on) {
 const state = {
   configured: false,
   tab: 'jira',
-  jira: { jql: 'assignee = currentUser() ORDER BY updated DESC', issues: [], sel: -1, detail: null, mode: 'list' },
-  conf: { spaces: [], space: '', pages: [], sel: -1, detail: null, mode: 'list', q: '' },
+  jira: { jql: 'assignee = currentUser() ORDER BY updated DESC', issues: [], sel: -1,
+          detail: null, mode: 'list', view: 'issues',
+          boards: [], board: null, sprints: [], sprint: null, columns: [],
+          bsel: { s: -1, i: -1 } },
+  conf: { spaces: [], space: '', pages: [], sel: -1, detail: null, mode: 'list',
+          q: '', cql: '', adv: false },
 };
 const cur = () => state.tab === 'jira' ? state.jira : state.conf;
 
@@ -189,11 +218,52 @@ function switchTab(tab) {
   document.body.classList.toggle('setup-mode', tab === 'setup');
   $('#list-pane').style.display = tab === 'setup' ? 'none' : '';
   setStatus(tab === 'jira' ? 'JIRA MODULE LOADED' : tab === 'conf' ? 'CONFLUENCE MODULE LOADED' : 'SETUP / CONFIGURATION');
-  if (tab === 'jira') { renderJiraListHead(); loadJiraIssues(); loadProjects(); }
+  if (tab === 'jira') {
+    if (state.jira.view === 'boards') renderJiraBoardHead();
+    else { renderJiraListHead(); loadJiraIssues(); }
+    loadProjects();
+  }
   else if (tab === 'conf') { loadSpaces(); renderConfListHead(); }
   else renderSetup();
 }
 document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+
+/* ============ shared detail widgets ============ */
+
+function attRowsHtml(atts) {
+  if (!atts || !atts.length) return '';
+  return atts.map(a => {
+    const img = (a.mime || '').startsWith('image/') && a.url;
+    const inner = img
+      ? `<img class="att-img" src="${esc(a.url)}" alt="${esc(a.filename)}" loading="lazy">`
+      : `<a href="${esc(a.url || '#')}" ${a.url ? 'target="_blank" rel="noopener"' : ''}>[ ${esc(a.filename || 'file')} ]</a>`;
+    return `<div class="att-row">${inner}
+      <span class="att-meta">${esc(a.mime || '')} ${fmtSize(a.size)}${a.author ? ' · ' + esc(a.author) : ''}</span></div>`;
+  }).join('');
+}
+
+function wireAttachments(uploadPath) {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.hidden = true;
+  document.body.appendChild(inp);
+  inp.addEventListener('change', async () => {
+    if (!inp.files.length) return;
+    const fd = new FormData();
+    fd.append('file', inp.files[0]);
+    try {
+      setStatus('UPLOADING ' + inp.files[0].name + '...');
+      const res = await fetch(uploadPath, { method: 'POST', body: fd });
+      const d = await res.json();
+      if (!res.ok || d.error) throw new Error(d.error || 'HTTP ' + res.status);
+      toast('ATTACHMENT UPLOADED', 'ok'); blip(1200, .04);
+      refreshDetail();
+    } catch (e) { /* toast shown by fetch? no — show manually */ toast('UPLOAD FAILED: ' + e.message, 'err'); }
+    inp.value = ''; inp.remove();
+  });
+  const btn = document.getElementById('att-upload');
+  if (btn) btn.onclick = () => inp.click();
+}
+let refreshDetail = () => {};
 
 /* ============ JIRA ============ */
 const JQL_PRESETS = [
@@ -205,21 +275,40 @@ const JQL_PRESETS = [
   ['UNASSIGNED', 'assignee is EMPTY AND resolution = Unresolved ORDER BY priority DESC'],
   ['RESOLVED LAST 7 DAYS', 'resolved >= -7d ORDER BY resolved DESC'],
 ];
+function savedJqls() {
+  try { return JSON.parse(localStorage.getItem('a86.jql.saved') || '[]'); }
+  catch (e) { return []; }
+}
 
 function renderJiraListHead() {
   const preset = JQL_PRESETS.some(([, j]) => j === state.jira.jql)
+    || savedJqls().some(s => s.jql === state.jira.jql)
     ? state.jira.jql : '';
+  const saved = savedJqls();
   $('#list-head').innerHTML = `
+    <div class="btn-row" style="margin:0">
+      <button class="act${state.jira.view === 'issues' ? ' primary' : ''}" data-view="issues">[ ISSUES ]</button>
+      <button class="act${state.jira.view === 'boards' ? ' primary' : ''}" data-view="boards">[ BOARDS ]</button>
+    </div>
     <label>QUERY</label>
     <select id="jql-preset">
       <option value=""${preset === '' ? ' selected' : ''}>— CUSTOM JQL —</option>
+      <optgroup label="PRESETS">
       ${JQL_PRESETS.map(([n, j]) => `<option value="${esc(j)}"${j === preset ? ' selected' : ''}>${n}</option>`).join('')}
+      </optgroup>
+      ${saved.length ? `<optgroup label="SAVED">${saved.map(s =>
+        `<option value="${esc(s.jql)}"${s.jql === preset ? ' selected' : ''}>★ ${esc(s.name)}</option>`).join('')}</optgroup>` : ''}
     </select>
     <input id="jql" type="text" value="${esc(state.jira.jql)}" spellcheck="false">
     <div class="btn-row">
       <button id="jrun" class="act primary">[ RUN QUERY ]</button>
+      <button id="jsave" class="act">[ SAVE JQL ]</button>
       <button id="jnew" class="act">[ NEW ISSUE ]</button>
     </div>`;
+  document.querySelectorAll('#list-head [data-view]').forEach(b =>
+    b.addEventListener('click', () => { state.jira.view = b.dataset.view;
+      if (state.jira.view === 'boards') renderJiraBoardHead();
+      else { renderJiraListHead(); loadJiraIssues(); } }));
   $('#jql-preset').addEventListener('change', e => {
     if (!e.target.value) return;
     $('#jql').value = e.target.value;
@@ -227,14 +316,36 @@ function renderJiraListHead() {
   });
   $('#jql').addEventListener('keydown', e => { if (e.key === 'Enter') loadJiraIssues(); });
   $('#jrun').addEventListener('click', loadJiraIssues);
+  $('#jsave').addEventListener('click', () => {
+    const jql = ($('#jql') || {}).value || state.jira.jql;
+    const name = prompt('NAME THIS FILTER');
+    if (!name) return;
+    const list = savedJqls().filter(s => s.name !== name);
+    list.push({ name, jql });
+    localStorage.setItem('a86.jql.saved', JSON.stringify(list));
+    renderJiraListHead();
+    toast('FILTER SAVED', 'ok');
+  });
   $('#jnew').addEventListener('click', newJiraIssue);
 }
+
+const box = () => $('#list-body');
+let vScrollBound = false;
+function bindVScroll() {
+  if (vScrollBound) return;
+  vScrollBound = true;
+  $('#list-body').addEventListener('scroll', () => {
+    if (state.tab === 'jira' && state.jira.view === 'issues') renderJiraRows();
+    else if (state.tab === 'conf') renderConfRows();
+  });
+}
+bindVScroll();
 
 async function loadJiraIssues() {
   state.jira.jql = $('#jql') ? $('#jql').value.trim() : state.jira.jql;
   setStatus('FETCHING TICKETS...');
   try {
-    const d = await api('/api/jira/issues?jql=' + encodeURIComponent(state.jira.jql) + '&limit=50');
+    const d = await api('/api/jira/issues?jql=' + encodeURIComponent(state.jira.jql) + '&limit=200');
     state.jira.jql = d.jql || state.jira.jql;
     if ($('#jql')) $('#jql').value = state.jira.jql;
     state.jira.issues = d.issues || [];
@@ -246,22 +357,18 @@ async function loadJiraIssues() {
 }
 
 function renderJiraRows() {
-  const box = $('#list-body');
-  if (!state.jira.issues.length) {
-    box.innerHTML = '<div class="empty">NO TICKETS. TRY ANOTHER JQL.</div>';
-    return;
-  }
-  box.innerHTML = state.jira.issues.map((it, i) => `
+  const b = box(), items = state.jira.issues;
+  if (!items.length) { b.innerHTML = '<div class="empty">NO TICKETS. TRY ANOTHER JQL.</div>'; return; }
+  vlistRender(b, items, state.jira.sel, (it, i) => `
     <div class="row${i === state.jira.sel ? ' sel' : ''}" data-i="${i}">
       <span class="key">${esc(it.key)}</span>
       <span class="title">${esc(it.summary)}</span>
-      <span class="meta">${esc(it.status)} · ${esc(it.issuetype)} · ${esc(it.assignee || '—')} · ${esc((it.updated || '').slice(0, 10))}</span>
-    </div>`).join('');
-  box.querySelectorAll('.row').forEach(r => r.addEventListener('click', () => {
-    state.jira.sel = +r.dataset.i;
+      <span class="meta">${esc(it.status)} · ${esc(it.assignee || '—')} · ${esc((it.updated || '').slice(0, 10))}</span>
+    </div>`, i => {
+    state.jira.sel = i;
     renderJiraRows();
-    openJiraIssue(state.jira.issues[state.jira.sel].key);
-  }));
+    openJiraIssue(items[i].key);
+  });
 }
 
 async function openJiraIssue(key) {
@@ -274,26 +381,58 @@ async function openJiraIssue(key) {
   } catch (e) { /* toast already shown */ }
 }
 
+const person = p => esc((p && (p.displayName || p.name)) || '—');
+
 function renderJiraDetail() {
   const it = state.jira.detail;
+  refreshDetail = () => openJiraIssue(it.key);
+  const statusName = (it.status && it.status.name) || it.status || '';
+  const typeName = (it.issuetype && it.issuetype.name) || it.issuetype || '';
   const comments = (it.comments || []).map(c => `
     <div class="comment">
       <div class="who">${esc(c.author)} — ${esc((c.created || '').replace('T', ' ').slice(0, 16))}</div>
       <div class="detail-body-html">${c.body_html || ''}</div>
     </div>`).join('');
   const trans = (it.transitions || []).map(t =>
-    `<button class="act" data-tid="${esc(t.id)}">[ ${esc((t.name || '').toUpperCase())} ]</button>`).join('');
+    `<button class="act" data-tid="${esc(t.id)}" data-toname="${esc(t.to || t.name || '')}">[ ${esc((t.name || '').toUpperCase())} ]</button>`).join('');
+  const links = (it.links || []).map(l => `
+    <div class="link-row">
+      <span class="link-desc">${l.direction === 'outward' ? '→' : '←'} ${esc(l.desc || l.type || '')}</span>
+      <a class="link-key" data-key="${esc(l.key)}">${esc(l.key)}</a>
+      <span class="link-sum">${esc(l.summary || '')} ${l.status ? '· ' + esc(l.status) : ''}</span>
+      <button class="act danger link-del" data-lid="${esc(l.id)}">[X]</button>
+    </div>`).join('');
+  const atts = attRowsHtml(it.attachments);
+  const watches = it.watches || {};
+  const votes = it.votes || {};
+  const tt = it.timetracking || {};
+  const hierarchy = [];
+  if (it.epic) hierarchy.push(`<div class="link-row"><span class="link-desc">EPIC</span><a class="link-key" data-key="${esc(it.epic)}">${esc(it.epic)}</a></div>`);
+  if (it.parent) hierarchy.push(`<div class="link-row"><span class="link-desc">PARENT</span><a class="link-key" data-key="${esc(it.parent.key)}">${esc(it.parent.key)}</a><span class="link-sum">${esc(it.parent.summary || '')}</span></div>`);
+  (it.children || []).forEach(c => hierarchy.push(
+    `<div class="link-row"><span class="link-desc">CHILD</span><a class="link-key" data-key="${esc(c.key)}">${esc(c.key)}</a><span class="link-sum">${esc(c.summary || '')} · ${esc(c.status || '')}</span></div>`));
+  (it.subtasks || []).forEach(s => hierarchy.push(
+    `<div class="link-row"><span class="link-desc">SUBTASK</span><a class="link-key" data-key="${esc(s.key)}">${esc(s.key)}</a><span class="link-sum">${esc(s.summary || '')} · ${esc(s.status || '')}</span></div>`));
   $('#detail-body').innerHTML = `
     <div class="detail-head">
       <h1>${esc(it.key)} — ${esc(it.summary)}</h1>
-      <div class="sub">${esc(it.status)} · ${esc(it.issuetype)} · UPDATED ${esc(it.updated || '')}</div>
+      <div class="sub">${esc(statusName)} · ${esc(typeName)} · UPDATED ${esc(it.updated || '')}</div>
     </div>
     <div class="kv">
-      <span class="k">ASSIGNEE</span><span class="v">${esc(it.assignee || '—')}</span>
-      <span class="k">REPORTER</span><span class="v">${esc(it.reporter || '—')}</span>
+      <span class="k">ASSIGNEE</span><span class="v">${person(it.assignee)}</span>
+      <span class="k">REPORTER</span><span class="v">${person(it.reporter)}</span>
+      ${it.priority ? `<span class="k">PRIORITY</span><span class="v">${esc(it.priority.name || it.priority)}</span>` : ''}
+      ${it.duedate ? `<span class="k">DUE DATE</span><span class="v">${esc(it.duedate)}</span>` : ''}
+      ${it.labels && it.labels.length ? `<span class="k">LABELS</span><span class="v">${it.labels.map(esc).join(', ')}</span>` : ''}
+      ${it.components && it.components.length ? `<span class="k">COMPONENTS</span><span class="v">${it.components.map(esc).join(', ')}</span>` : ''}
+      ${it.fixVersions && it.fixVersions.length ? `<span class="k">FIX VERSIONS</span><span class="v">${it.fixVersions.map(esc).join(', ')}</span>` : ''}
+      ${(tt.originalEstimate || tt.remainingEstimate || tt.timeSpent) ? `<span class="k">TIME TRACK</span><span class="v">${esc([tt.timeSpent && 'spent ' + tt.timeSpent, tt.remainingEstimate && 'left ' + tt.remainingEstimate, tt.originalEstimate && 'orig ' + tt.originalEstimate].filter(Boolean).join(' · '))}</span>` : ''}
+      ${watches.watchCount != null ? `<span class="k">WATCHERS</span><span class="v">${watches.watchCount}${watches.isWatching ? ' (YOU)' : ''}</span>` : ''}
+      ${votes.votes != null ? `<span class="k">VOTES</span><span class="v">${votes.votes}${votes.hasVoted ? ' (YOU)' : ''}</span>` : ''}
       ${(it.attributes || []).map(a =>
         `<span class="k">${esc((a.name || '').toUpperCase())}</span><span class="v">${esc(a.value)}</span>`).join('')}
     </div>
+    ${hierarchy.length ? `<div class="detail-section"><h2>HIERARCHY</h2>${hierarchy.join('')}</div>` : ''}
     <div class="detail-section"><h2>DESCRIPTION</h2>
       <div class="detail-body-html">${it.description_html || '<i>(empty)</i>'}</div></div>
     <div class="detail-section"><h2>COMMENTS</h2>${comments || '<div class="sub">NO COMMENTS YET.</div>'}
@@ -303,17 +442,184 @@ function renderJiraDetail() {
     <div class="detail-section"><h2>TRANSITION STATUS</h2>
       <div class="btn-row" id="trans-row">${trans || '<span class="sub">NO TRANSITIONS AVAILABLE</span>'}</div>
     </div>
-    <div class="btn-row">
-      <button id="d-edit" class="act primary">[ E / EDIT ]</button>
-      <button id="d-back" class="act">[ ESC / BACK ]</button>
-      <button id="d-del" class="act danger">[ D / DELETE ]</button>
+    <div class="detail-section"><h2>LINKS</h2>
+      <div id="links-list">${links || '<div class="sub">NO LINKS.</div>'}</div>
+      <div class="link-add">
+        <select id="lk-type"></select>
+        <select id="lk-dir"></select>
+        <input id="lk-other" type="text" placeholder="ISSUE KEY">
+        <button id="lk-add" class="act">[ LINK ]</button>
+      </div>
+    </div>
+    <div class="detail-section"><h2>ATTACHMENTS</h2>
+      ${atts || '<div class="sub">NO ATTACHMENTS.</div>'}
+      <div class="btn-row"><button id="att-upload" class="act">[ ATTACH FILE ]</button></div>
+    </div>
+    <div class="detail-section"><h2>ACTIONS</h2>
+      <div class="btn-row">
+        <button id="d-watch" class="act">[ ${watches.isWatching ? 'UNWATCH' : 'WATCH'} ]</button>
+        <button id="d-vote" class="act" ${votes.hasVoted ? 'disabled' : ''}>[ VOTE${votes.votes ? ' (' + votes.votes + ')' : ''} ]</button>
+        <button id="d-fields" class="act">[ EDIT FIELDS ]</button>
+        <button id="d-edit" class="act primary">[ E / EDIT ]</button>
+        <button id="d-back" class="act">[ ESC / BACK ]</button>
+        <button id="d-del" class="act danger">[ D / DELETE ]</button>
+      </div>
+      <div class="link-add" id="watch-add-row" style="margin-top:8px">
+        <input id="watch-user" type="text" placeholder="ADD WATCHER (NAME / ACCOUNT ID)" style="flex:1">
+        <button id="watch-add" class="act">[ ADD WATCHER ]</button>
+      </div>
     </div>`;
   $('#d-edit').onclick = editJiraIssue;
   $('#d-back').onclick = backToList;
   $('#d-del').onclick = deleteJiraIssue;
+  $('#d-fields').onclick = editJiraFields;
   $('#cmt-post').onclick = postComment;
+  $('#d-watch').onclick = toggleWatch;
+  $('#d-vote').onclick = () => voteIssue(it.key);
+  $('#watch-add').onclick = addWatcher;
+  wireAttachments('/api/jira/issue/' + encodeURIComponent(it.key) + '/attachment');
   document.querySelectorAll('#trans-row .act').forEach(b =>
     b.addEventListener('click', () => applyTransition(b.dataset.tid)));
+  document.querySelectorAll('.link-key').forEach(a =>
+    a.addEventListener('click', () => openJiraIssue(a.dataset.key)));
+  document.querySelectorAll('.link-del').forEach(b =>
+    b.addEventListener('click', () => deleteLink(b.dataset.lid)));
+  loadLinkTypes(it.key);
+}
+
+async function loadLinkTypes(key) {
+  const sel = $('#lk-type'), dir = $('#lk-dir');
+  if (!sel) return;
+  try {
+    const types = await api('/api/jira/issue/' + encodeURIComponent(key) + '/linktypes');
+    sel.innerHTML = types.map(t => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('');
+    const paintDir = () => {
+      const t = types.find(x => x.name === sel.value) || types[0] || {};
+      dir.innerHTML =
+        `<option value="outward">THIS ISSUE ${esc(t.outward || 'OUTWARD')} ${esc($('#lk-other').value || 'OTHER')}</option>` +
+        `<option value="inward">THIS ISSUE ${esc(t.inward || 'INWARD')} ${esc($('#lk-other').value || 'OTHER')}</option>`;
+    };
+    sel.onchange = paintDir;
+    $('#lk-other').addEventListener('input', paintDir);
+    paintDir();
+    $('#lk-add').onclick = async () => {
+      const other = $('#lk-other').value.trim();
+      if (!other) { toast('ENTER AN ISSUE KEY', 'err'); return; }
+      await api('/api/jira/issue/' + encodeURIComponent(key) + '/link', {
+        method: 'POST',
+        body: { type: sel.value, other, direction: dir.value },
+      });
+      toast('LINK ADDED', 'ok'); blip(1200, .04);
+      await openJiraIssue(key);
+    };
+  } catch (e) { sel.innerHTML = ''; }
+}
+
+async function deleteLink(lid) {
+  const it = state.jira.detail;
+  await api('/api/jira/issue/' + encodeURIComponent(it.key) + '/link/' + encodeURIComponent(lid),
+    { method: 'DELETE' });
+  toast('LINK REMOVED', 'ok');
+  await openJiraIssue(it.key);
+}
+
+async function toggleWatch() {
+  const it = state.jira.detail;
+  if (it.watches && it.watches.isWatching) {
+    await api('/api/jira/issue/' + encodeURIComponent(it.key) + '/watchers',
+      { method: 'DELETE' });
+  } else {
+    await api('/api/jira/issue/' + encodeURIComponent(it.key) + '/watchers',
+      { method: 'POST', body: {} });
+  }
+  toast('WATCH UPDATED', 'ok');
+  await openJiraIssue(it.key);
+}
+
+async function addWatcher() {
+  const it = state.jira.detail, inp = $('#watch-user');
+  const who = inp.value.trim();
+  if (!who) return;
+  const body = /^[A-Za-z0-9:._-]{8,}$/.test(who) && who.length > 12
+    ? { accountId: who } : { name: who };
+  await api('/api/jira/issue/' + encodeURIComponent(it.key) + '/watchers',
+    { method: 'POST', body });
+  toast('WATCHER ADDED', 'ok');
+  await openJiraIssue(it.key);
+}
+
+async function voteIssue(key) {
+  await api('/api/jira/issue/' + encodeURIComponent(key) + '/vote', { method: 'POST', body: {} });
+  toast('VOTE CAST', 'ok'); blip(1320, .05);
+  await openJiraIssue(key);
+}
+
+async function editJiraFields() {
+  const it = state.jira.detail;
+  if (!it) return;
+  let meta = { fields: {} };
+  try { meta = await api('/api/jira/issue/' + encodeURIComponent(it.key) + '/editmeta'); } catch (e) { /* degrade to plain inputs */ }
+  const byName = n => Object.values(meta.fields || {}).find(f =>
+    (f.name || '').toLowerCase() === n);
+  const opts = f => (f && f.allowedValues || []).map(v =>
+    `<option value="${esc(v.value ?? v.id ?? '')}">${esc(v.value ?? v.id ?? '')}</option>`).join('');
+  const dl = (id, f) => `<datalist id="${id}">${opts(f)}</datalist>`;
+  const prio = byName('priority'), comp = byName('components'), fv = byName('fix versions');
+  openEditor({
+    title: false,
+    fieldsHTML: `
+      <label>PRIORITY</label>
+      <input id="f-priority" type="text" list="dl-prio" value="${esc(it.priority ? (it.priority.name || it.priority) : '')}">
+      ${dl('dl-prio', prio)}
+      <label>DUE DATE</label>
+      <input id="f-duedate" type="date" value="${esc(it.duedate || '')}">
+      <label>LABELS (COMMA SEPARATED)</label>
+      <input id="f-labels" type="text" value="${esc((it.labels || []).join(', '))}">
+      <label>COMPONENTS (COMMA SEPARATED)</label>
+      <input id="f-components" type="text" list="dl-comp" value="${esc((it.components || []).join(', '))}">
+      ${dl('dl-comp', comp)}
+      <label>FIX VERSIONS (COMMA SEPARATED)</label>
+      <input id="f-fixversions" type="text" list="dl-fv" value="${esc((it.fixVersions || []).join(', '))}">
+      ${dl('dl-fv', fv)}
+      <label>ASSIGNEE (NAME / ACCOUNT ID / EMAIL)</label>
+      <input id="f-assignee" type="text" list="dl-users" value="${esc(person(it.assignee))}">
+      <datalist id="dl-users"></datalist>`,
+    html: '',
+    onSave: async () => {
+      const fields = {};
+      const pr = readField('f-priority'); if (pr) fields.priority = pr;
+      const dd = readField('f-duedate'); if (dd) fields.duedate = dd;
+      fields.labels = readField('f-labels');
+      fields.components = readField('f-components');
+      fields.fixVersions = readField('f-fixversions');
+      const who = readField('f-assignee');
+      if (who && who !== person(it.assignee)) {
+        try {
+          const users = await api('/api/jira/users?q=' + encodeURIComponent(who));
+          const u = users.find(x =>
+            [x.displayName, x.name, x.email].includes(who)) || users[0];
+          fields.assignee = u && u.accountId ? { accountId: u.accountId } : who;
+        } catch (e) { fields.assignee = who; }
+      }
+      setStatus('WRITING FIELDS...');
+      await api('/api/jira/issue/' + encodeURIComponent(it.key), {
+        method: 'PUT', body: { fields },
+      });
+      toast(it.key + ' FIELDS UPDATED', 'ok');
+      await openJiraIssue(it.key);
+    },
+  });
+  // warm the assignee datalist
+  const inp = $('#f-assignee');
+  inp && inp.addEventListener('input', async () => {
+    const q = inp.value.trim();
+    if (q.length < 2) return;
+    try {
+      const users = await api('/api/jira/users?q=' + encodeURIComponent(q));
+      $('#dl-users').innerHTML = users.map(u =>
+        `<option value="${esc(u.displayName || u.name)}">${esc(u.email || '')}</option>`).join('');
+    } catch (e) { /* ignore */ }
+  });
 }
 
 function editJiraIssue() {
@@ -395,6 +701,137 @@ async function loadProjects() {
   try { state.projects = await api('/api/jira/projects'); } catch (e) { state.projects = []; }
 }
 
+/* ============ JIRA BOARDS ============ */
+function renderJiraBoardHead() {
+  const j = state.jira;
+  const projOpts = (state.projects || []).map(p =>
+    `<option value="${esc(p.key)}"${p.key === j.boardProject ? ' selected' : ''}>${esc(p.key)} — ${esc(p.name)}</option>`).join('');
+  const boardOpts = j.boards.map(b =>
+    `<option value="${b.id}"${String(b.id) === String(j.board && j.board.id) ? ' selected' : ''}>${esc(b.name)}</option>`).join('');
+  const sprintOpts = j.sprints.map(s =>
+    `<option value="${s.id}"${String(s.id) === String(j.sprint && j.sprint.id) ? ' selected' : ''}>${esc(s.name)} [${esc(s.state || '')}]</option>`).join('');
+  $('#list-head').innerHTML = `
+    <div class="btn-row" style="margin:0">
+      <button class="act" data-view="issues">[ ISSUES ]</button>
+      <button class="act primary" data-view="boards">[ BOARDS ]</button>
+    </div>
+    <label>PROJECT</label>
+    <select id="b-project"><option value="">— ALL PROJECTS —</option>${projOpts}</select>
+    <label>BOARD</label>
+    <select id="b-board"><option value="">— PICK PROJECT FIRST —</option>${boardOpts}</select>
+    <label>SPRINT</label>
+    <select id="b-sprint"><option value="">— PICK BOARD FIRST —</option>${sprintOpts}</select>
+    <div class="btn-row"><button id="b-load" class="act primary">[ LOAD BOARD ]</button></div>`;
+  document.querySelectorAll('#list-head [data-view]').forEach(b =>
+    b.addEventListener('click', () => { state.jira.view = b.dataset.view;
+      if (state.jira.view === 'boards') renderJiraBoardHead();
+      else { renderJiraListHead(); loadJiraIssues(); } }));
+  $('#b-project').addEventListener('change', async e => {
+    j.boardProject = e.target.value;
+    j.board = null; j.sprints = []; j.sprint = null; j.columns = [];
+    setStatus('FETCHING BOARDS...');
+    try {
+      j.boards = await api('/api/jira/boards?project=' + encodeURIComponent(j.boardProject));
+      toast(j.boards.length + ' BOARD(S)', 'info');
+    } catch (err) { j.boards = []; }
+    renderJiraBoardHead();
+  });
+  $('#b-board').addEventListener('change', async e => {
+    j.board = j.boards.find(b => String(b.id) === e.target.value) || null;
+    j.sprints = []; j.sprint = null; j.columns = [];
+    if (!j.board) { renderJiraBoardHead(); return; }
+    setStatus('FETCHING SPRINTS...');
+    try {
+      j.sprints = await api('/api/jira/boards/' + encodeURIComponent(j.board.id) + '/sprints');
+      j.sprint = j.sprints.find(s => s.state === 'active') || j.sprints[0] || null;
+      if (j.sprint) await loadBoard();
+    } catch (err) { /* toast shown */ }
+    renderJiraBoardHead();
+  });
+  $('#b-sprint').addEventListener('change', async e => {
+    j.sprint = j.sprints.find(s => String(s.id) === e.target.value) || null;
+    if (j.sprint) await loadBoard();
+    renderJiraBoardHead();
+  });
+  $('#b-load').addEventListener('click', loadBoard);
+}
+
+async function loadBoard() {
+  const j = state.jira;
+  if (!j.sprint) return;
+  setStatus('LOADING SPRINT BOARD...');
+  try {
+    const cards = await api('/api/jira/sprints/' + encodeURIComponent(j.sprint.id) + '/issues');
+    const cols = new Map();
+    for (const c of cards) {
+      const s = c.status || 'UNKNOWN';
+      if (!cols.has(s)) cols.set(s, []);
+      cols.get(s).push(c);
+    }
+    j.columns = [...cols.entries()].map(([name, issues]) => ({ name, issues }));
+    j.bsel = { s: -1, i: -1 };
+    renderBoard();
+    setStatus(j.columns.reduce((n, c) => n + c.issues.length, 0) + ' CARD(S) ON BOARD');
+    blip(1200, .04);
+  } catch (e) { /* toast shown */ }
+}
+
+function boardFlat() {
+  const out = [];
+  state.jira.columns.forEach((c, s) => c.issues.forEach((card, i) => out.push({ s, i, card })));
+  return out;
+}
+
+function renderBoard() {
+  const j = state.jira;
+  if (!j.columns.length) {
+    $('#detail-body').innerHTML = '<div class="empty">NO BOARD LOADED. PICK PROJECT → BOARD → SPRINT.</div>';
+    return;
+  }
+  $('#detail-body').innerHTML = `
+    <div class="detail-head">
+      <h1>BOARD // ${esc(j.board ? j.board.name : '')} — ${esc(j.sprint ? j.sprint.name : '')}</h1>
+      <div class="sub">${esc(j.sprint ? j.sprint.state : '')} · ${j.columns.reduce((n, c) => n + c.issues.length, 0)} CARD(S) · [ / ] MOVE CARD · J/K NAV · ENTER OPEN</div>
+    </div>
+    <div class="board">${j.columns.map((c, s) => `
+      <div class="board-col">
+        <div class="board-col-head">${esc(c.name)} <span class="board-count">${c.issues.length}</span></div>
+        ${c.issues.map((card, i) => `
+          <div class="bcard${j.bsel.s === s && j.bsel.i === i ? ' sel' : ''}" data-s="${s}" data-i="${i}">
+            <div class="bcard-key">${esc(card.key)}</div>
+            <div class="bcard-sum">${esc(card.summary)}</div>
+            <div class="bcard-meta">${esc(card.assignee || '—')}${card.points ? ' · ' + esc(card.points) + 'pt' : ''}</div>
+          </div>`).join('')}
+      </div>`).join('')}
+    </div>`;
+  document.querySelectorAll('.bcard').forEach(el => el.addEventListener('click', () => {
+    j.bsel = { s: +el.dataset.s, i: +el.dataset.i };
+    openJiraIssue(j.columns[j.bsel.s].issues[j.bsel.i].key);
+  }));
+}
+
+async function moveBoardCard(dir) {
+  const j = state.jira;
+  const { s, i } = j.bsel;
+  if (s < 0 || i < 0 || !j.columns[s]) return;
+  const ns = s + dir;
+  if (ns < 0 || ns >= j.columns.length) { toast('EDGE OF BOARD', 'info'); return; }
+  const card = j.columns[s].issues[i];
+  const target = j.columns[ns].name;
+  try {
+    const d = await api('/api/jira/issue/' + encodeURIComponent(card.key));
+    const t = (d.transitions || []).find(x =>
+      (x.to || '').toLowerCase() === target.toLowerCase() ||
+      (x.name || '').toLowerCase() === target.toLowerCase());
+    if (!t) { toast('NO TRANSITION TO ' + target.toUpperCase(), 'err'); return; }
+    await api('/api/jira/issue/' + encodeURIComponent(card.key), {
+      method: 'PUT', body: { transition_id: t.id },
+    });
+    toast(card.key + ' → ' + target, 'ok'); blip(1200, .04);
+    await loadBoard();
+  } catch (e) { /* toast shown */ }
+}
+
 /* ============ CONFLUENCE ============ */
 async function loadSpaces() {
   try {
@@ -417,6 +854,10 @@ function renderConfListHead() {
     <select id="cspace"><option value="">— ALL / NONE —</option>${confSpaceOpts()}</select>
     <label>SEARCH TITLE</label>
     <input id="cq" type="text" value="${esc(state.conf.q)}" placeholder="TITLE CONTAINS..." spellcheck="false">
+    <div class="btn-row" style="margin:0">
+      <button id="cadv" class="act${state.conf.adv ? ' primary' : ''}">[ CQL ]</button>
+    </div>
+    <input id="ccql" type="text" value="${esc(state.conf.cql)}" placeholder='type=page AND space="DOC"' spellcheck="false" ${state.conf.adv ? '' : 'hidden'}>
     <div class="btn-row">
       <button id="crun" class="act primary">[ SEARCH ]</button>
       <button id="cnew" class="act">[ NEW PAGE ]</button>
@@ -426,6 +867,12 @@ function renderConfListHead() {
   });
   $('#cspace').addEventListener('change', e => { state.conf.space = e.target.value; loadConfPages(); });
   $('#cq').addEventListener('keydown', e => { if (e.key === 'Enter') loadConfPages(); });
+  $('#ccql').addEventListener('keydown', e => { if (e.key === 'Enter') loadConfPages(); });
+  $('#cadv').addEventListener('click', () => {
+    state.conf.adv = !state.conf.adv;
+    renderConfListHead();
+    if (state.conf.adv) $('#ccql').focus();
+  });
   $('#crun').addEventListener('click', loadConfPages);
   $('#cnew').addEventListener('click', newConfPage);
 }
@@ -433,10 +880,14 @@ function renderConfListHead() {
 async function loadConfPages() {
   state.conf.space = $('#cspace') ? $('#cspace').value : state.conf.space;
   state.conf.q = $('#cq') ? $('#cq').value.trim() : state.conf.q;
-  setStatus('SCANNING WIKI...');
+  state.conf.cql = $('#ccql') ? $('#ccql').value.trim() : state.conf.cql;
+  setStatus(state.conf.adv ? 'RUNNING CQL...' : 'SCANNING WIKI...');
   try {
-    const d = await api('/api/confluence/pages?space=' + encodeURIComponent(state.conf.space) +
-      '&q=' + encodeURIComponent(state.conf.q) + '&limit=50');
+    const path = state.conf.adv && state.conf.cql
+      ? '/api/confluence/cql?cql=' + encodeURIComponent(state.conf.cql) + '&limit=200'
+      : '/api/confluence/pages?space=' + encodeURIComponent(state.conf.space) +
+        '&q=' + encodeURIComponent(state.conf.q) + '&limit=200';
+    const d = await api(path);
     state.conf.pages = d.pages || [];
     state.conf.sel = -1; state.conf.mode = 'list';
     renderConfRows();
@@ -446,22 +897,18 @@ async function loadConfPages() {
 }
 
 function renderConfRows() {
-  const box = $('#list-body');
-  if (!state.conf.pages.length) {
-    box.innerHTML = '<div class="empty">NO PAGES. PICK A SPACE OR SEARCH.</div>';
-    return;
-  }
-  box.innerHTML = state.conf.pages.map((p, i) => `
+  const b = box(), items = state.conf.pages;
+  if (!items.length) { b.innerHTML = '<div class="empty">NO PAGES. PICK A SPACE OR SEARCH.</div>'; return; }
+  vlistRender(b, items, state.conf.sel, (p, i) => `
     <div class="row${i === state.conf.sel ? ' sel' : ''}" data-i="${i}">
       <span class="key">[${esc(p.space)}]</span>
       <span class="title">${esc(p.title)}</span>
       <span class="meta">${esc((p.updated || '').slice(0, 10))}</span>
-    </div>`).join('');
-  box.querySelectorAll('.row').forEach(r => r.addEventListener('click', () => {
-    state.conf.sel = +r.dataset.i;
+    </div>`, i => {
+    state.conf.sel = i;
     renderConfRows();
-    openConfPage(state.conf.pages[state.conf.sel].id);
-  }));
+    openConfPage(items[i].id);
+  });
 }
 
 async function openConfPage(id) {
@@ -476,13 +923,29 @@ async function openConfPage(id) {
 
 function renderConfDetail() {
   const p = state.conf.detail;
+  refreshDetail = () => openConfPage(p.id);
+  const crumbs = (p.ancestors || []).map(a =>
+    `<a class="crumb" data-id="${esc(a.id)}">${esc(a.title)}</a>`).join(' / ');
+  const children = (p.children || []).map(c =>
+    `<div class="link-row"><a class="link-key" data-id="${esc(c.id)}">${esc(c.title)}</a></div>`).join('');
+  const labels = (p.labels || []).map(l => `<span class="chip">${esc(l)}</span>`).join(' ');
+  const atts = attRowsHtml(p.attachments);
   $('#detail-body').innerHTML = `
     <div class="detail-head">
       <h1>${esc(p.title)}</h1>
       <div class="sub">SPACE ${esc(p.space)} (${esc(p.space_name || '')}) · VERSION ${esc(p.version)}</div>
+      ${crumbs ? `<div class="crumbs">ROOT / ${crumbs} / <b>${esc(p.title)}</b></div>` : ''}
+      ${labels ? `<div class="chips-row">${labels}</div>` : ''}
     </div>
     <div class="detail-section"><h2>CONTENT</h2>
       <div class="detail-body-html">${p.body_html || '<i>(empty)</i>'}</div></div>
+    ${children ? `<div class="detail-section"><h2>CHILD PAGES</h2>${children}</div>` : ''}
+    <div class="detail-section"><h2>ATTACHMENTS</h2>
+      ${atts || '<div class="sub">NO ATTACHMENTS.</div>'}
+      <div class="btn-row"><button id="att-upload" class="act">[ ATTACH FILE ]</button>
+      <button id="hist-btn" class="act">[ HISTORY ]</button></div>
+      <div id="hist-box"></div>
+    </div>
     <div class="btn-row">
       <button id="d-edit" class="act primary">[ E / EDIT ]</button>
       <button id="d-back" class="act">[ ESC / BACK ]</button>
@@ -491,6 +954,20 @@ function renderConfDetail() {
   $('#d-edit').onclick = editConfPage;
   $('#d-back').onclick = backToList;
   $('#d-del').onclick = deleteConfPage;
+  wireAttachments('/api/confluence/page/' + encodeURIComponent(p.id) + '/attachment');
+  document.querySelectorAll('.crumb, .link-key[data-id]').forEach(a =>
+    a.addEventListener('click', () => openConfPage(a.dataset.id)));
+  $('#hist-btn').onclick = async () => {
+    const hb = $('#hist-box');
+    if (hb.dataset.loaded) { hb.innerHTML = ''; delete hb.dataset.loaded; return; }
+    try {
+      const h = await api('/api/confluence/page/' + encodeURIComponent(p.id) + '/history');
+      hb.innerHTML = h.map(v =>
+        `<div class="link-row"><span class="link-desc">v${esc(v.number)}</span>
+         <span class="link-sum">${esc(v.by || '')} · ${esc((v.when || '').slice(0, 10))}${v.message ? ' · ' + esc(v.message) : ''}</span></div>`).join('');
+      hb.dataset.loaded = '1';
+    } catch (e) { hb.innerHTML = '<div class="sub">HISTORY UNAVAILABLE</div>'; }
+  };
 }
 
 function editConfPage() {
@@ -602,7 +1079,10 @@ async function renderSetup() {
 function backToList() {
   const s = cur();
   s.mode = 'list'; s.detail = null;
-  if (state.tab === 'jira') { renderJiraDetailEmpty(); loadJiraIssues(); }
+  if (state.tab === 'jira') {
+    if (state.jira.view === 'boards') { renderBoard(); }
+    else { renderJiraDetailEmpty(); loadJiraIssues(); }
+  }
   else { renderConfDetailEmpty(); loadConfPages(); }
 }
 function renderJiraDetailEmpty() {
@@ -620,7 +1100,6 @@ function currentItem() {
   const sel = s.sel >= 0 ? s.issuesOrPages() : null;
   return sel;
 }
-// small adapter so currentItem reads the right list
 state.jira.issuesOrPages = () => state.jira.issues[state.jira.sel] && { kind: 'jira', key: state.jira.issues[state.jira.sel].key };
 state.conf.issuesOrPages = () => state.conf.pages[state.conf.sel] && { kind: 'conf', id: state.conf.pages[state.conf.sel].id };
 
@@ -632,7 +1111,6 @@ function typingTarget() {
 window.addEventListener('keydown', async e => {
   if (!bootDone || performance.now() - bootDismissedAt < 80) return;
 
-  // editor overlay owns the keyboard
   if (!$('#editor-overlay').hidden) {
     if (e.key === 'Escape') { e.preventDefault(); closeEditor(); }
     return;
@@ -654,7 +1132,6 @@ window.addEventListener('keydown', async e => {
     return;
   }
 
-  // escape: unfocus inputs first, then back out of detail / setup
   if (e.key === 'Escape') {
     if (typingTarget()) { document.activeElement.blur(); return; }
     if (state.tab === 'setup') switchTab('jira');
@@ -669,6 +1146,30 @@ window.addEventListener('keydown', async e => {
   }
 
   const s = cur();
+
+  // ---- board mode owns the keyboard ----
+  if (state.tab === 'jira' && state.jira.view === 'boards' && s.mode !== 'detail') {
+    const flat = boardFlat();
+    switch (e.key) {
+      case '1': case '2': case '3':
+        e.preventDefault(); switchTab(TABS[+e.key - 1]); return;
+      case '?': e.preventDefault(); toggleHelp(true); return;
+      case '/': e.preventDefault(); const bp = $('#b-project'); if (bp) bp.focus(); return;
+      case 'j': case 'ArrowDown': boardMove(1); return;
+      case 'k': case 'ArrowUp': boardMove(-1); return;
+      case ']': case 'l': e.preventDefault(); moveBoardCard(1); return;
+      case '[': case 'h': e.preventDefault(); moveBoardCard(-1); return;
+      case 'Enter': {
+        const f = flat.findIndex(x => x.s === s.bsel.s && x.i === s.bsel.i);
+        if (f >= 0) openJiraIssue(flat[f].card.key);
+        return;
+      }
+      case 'r': e.preventDefault(); loadBoard(); return;
+      case 'n': newJiraIssue(); return;
+    }
+    return;
+  }
+
   const list = state.tab === 'jira' ? state.jira.issues : state.conf.pages;
 
   switch (e.key) {
@@ -677,14 +1178,14 @@ window.addEventListener('keydown', async e => {
     case '?': e.preventDefault(); toggleHelp(true); break;
     case '/': {
       e.preventDefault();
-      const inp = $('#jql') || $('#csfilter') || $('#cq');
-      if (inp) inp.focus();
+      const inp = $('#jql') || $('#csfilter') || $('#cq') || $('#ccql');
+      if (inp && !inp.hidden) inp.focus();
       break;
     }
     case 'j': case 'ArrowDown': moveSel(1); break;
     case 'k': case 'ArrowUp': moveSel(-1); break;
     case 'Enter': {
-      if (e.target && e.target.tagName === 'BUTTON') break; // let the button's own click fire
+      if (e.target && e.target.tagName === 'BUTTON') break;
       if (s.sel >= 0 && list[s.sel]) {
         if (state.tab === 'jira') openJiraIssue(list[s.sel].key);
         else openConfPage(list[s.sel].id);
@@ -730,14 +1231,28 @@ window.addEventListener('keydown', async e => {
   }
 });
 
+function boardMove(dir) {
+  const j = state.jira, flat = boardFlat();
+  if (!flat.length) return;
+  if (j.bsel.s < 0) { j.bsel = { s: flat[0].s, i: flat[0].i }; }
+  else {
+    const idx = flat.findIndex(x => x.s === j.bsel.s && x.i === j.bsel.i);
+    const n = Math.max(0, Math.min(flat.length - 1, idx + dir));
+    j.bsel = { s: flat[n].s, i: flat[n].i };
+  }
+  renderBoard();
+  const el = document.querySelector(`.bcard[data-s="${j.bsel.s}"][data-i="${j.bsel.i}"]`);
+  if (el) el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
 function moveSel(dir) {
   const s = cur();
   const list = state.tab === 'jira' ? state.jira.issues : state.conf.pages;
   if (!list.length) return;
   s.sel = Math.max(0, Math.min(list.length - 1, (s.sel < 0 ? (dir > 0 ? -1 : 0) : s.sel) + dir));
+  const b = box();
+  vlistEnsureVisible(b, s.sel);
   if (state.tab === 'jira') renderJiraRows(); else renderConfRows();
-  const el = $('#list-body .row.sel');
-  if (el) el.scrollIntoView({ block: 'nearest' });
 }
 
 /* ============ gutter drag ============ */
