@@ -132,8 +132,15 @@ def _diagram_previews(storage_html, attachments):
     out, seen = [], set()
     for name in wanted:
         a = by_name.get(name)
-        if not a:
-            # diagram source -> look for rendered sibling image
+        # prefer a rendered sibling image over the diagram source file
+        if a and not (a.get("mime") or "").startswith("image/"):
+            base = stem(name)
+            for ext in (".png", ".svg", ".jpg", ".jpeg"):
+                cand = by_name.get(base + ext)
+                if cand:
+                    a = cand
+                    break
+        if not a and name not in by_name:
             base = stem(name)
             for ext in (".png", ".svg", ".jpg", ".jpeg"):
                 cand = by_name.get(base + ext)

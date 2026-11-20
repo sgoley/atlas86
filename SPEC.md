@@ -98,6 +98,23 @@ mutation clears the cache.
   issuetype,assignee,priority,points,epic,updated}]`
 - `GET  /api/confluence/page/<id>` now also returns `ancestors`, `children`,
   `labels`, `attachments` (each with proxy `url`).
+- `GET  /api/jira/boards/<id>/backlog` -> backlog issues as sprint cards
+- `GET  /api/jira/boards/<id>/configuration` -> `{columns:[{name,statuses:[{id,name}]}]}`
+- `POST /api/jira/sprints/<id>/issues` `{keys:[]}` -> add to sprint
+- `POST /api/jira/backlog/issues` `{keys:[]}` -> move to backlog
+- `POST /api/jira/issues/rank` `{keys:[], before}` -> rank before issue
+- `POST /api/jira/sprints` `{name,board_id,startDate?,endDate?,goal?}`
+- `POST /api/jira/sprints/<id>/state` `{state:active|closed}`
+- `GET  /api/jira/issue/<key>/worklog` -> `{worklogs:[{id,author,timeSpent,started,comment}]}`
+- `POST /api/jira/issue/<key>/worklog` `{timeSpent,started?,comment?}`
+- `POST /api/jira/issue/<key>/remlink` `{url,title?}`; `DELETE .../remlink/<id>`
+- `POST /api/jira/issue` accepts optional `parent` (subtask creation)
+- `GET  /api/confluence/page/<id>/restrictions` -> `[{type,name}]` read restrictions
+- `POST|DELETE /api/confluence/page/<id>/label` (+ `?name=` on DELETE)
+- `PUT  /api/confluence/page/<id>/move` `{space,parent_id?}`
+- `POST /api/confluence/page/<id>/copy` `{title?,space?,parent_id?}` -> `{id}`
+- `GET  /api/confluence/page/<id>` also returns `diagrams` (best-effort
+  drawio/gliffy/plantuml attachment previews resolved from body.storage)
 - `GET  /api/confluence/page/<id>/history` -> `[{number,when,by,message}]`
 - `GET  /api/confluence/cql?cql=&limit=` -> `{pages:[...]}` raw CQL passthrough
 - `GET  /api/confluence/attachment?dl=<_links.download path>` -> proxied bytes;

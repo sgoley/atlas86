@@ -35,3 +35,34 @@
   backlink on child issues.
 - **No new dependencies.** Everything above is stdlib + existing flask /
   atlassian-python-api calls.
+
+## v0.3.0 — parity tranche 2
+
+- **Board columns come from `/rest/agile/1.0/board/{id}/configuration`**
+  (status-id mapping, configured order). Cards whose status isn't mapped land
+  in an OTHER column; epic swimlanes keep the old grouping and disable moves.
+- **Card moves always go through transitions.** Drag-and-drop and `[`/`]`
+  share `moveCardToColumn`, which matches the target column's status names
+  against `transition.to`/`name`. No direct status writes — the workflow
+  stays authoritative.
+- **Rank uses the lib's `update_rank` (`rankBeforeIssue`)** with the field id
+  discovered by name "Rank" via `/field`. Only up/down-by-one is exposed;
+  arbitrary positioning would need rankAfterIssue plumbing nobody asked for.
+- **Sprint state changes use `update_partially_sprint`** (`state: active|
+  closed`); creating sprints uses `create_sprint` (name + board + optional
+  dates/goal).
+- **Worklog comments are ADF on Cloud, plain text on Server/DC**, matching the
+  existing write-format split. Worklog list is fetched lazily per issue view.
+- **Remote links use raw REST** (`/issue/{key}/remotelink`) because the lib's
+  remote-link helpers are inconsistently shaped across versions; GET rides
+  along in the detail fan-out.
+- **Confluence copy re-uses storage format** (`representation='storage'`) so
+  macros survive the copy; parent defaults to the source page's last ancestor.
+- **Page move uses `conf.move_page`** with `position='append'` under the new
+  parent; root moves pass `target_id=None`.
+- **Diagram previews are resolved server-side** from `body.storage` macro
+  blocks: filenames inside drawio/gliffy/diagram/plantuml macros are matched
+  to attachments, preferring a same-basename image sibling over the source
+  file. Failure modes degrade to a plain link or nothing — never worse than
+  before. No drawio renderer is embedded (would need JS/SVG pipeline); the
+  `.drawio` XML itself is not rendered.

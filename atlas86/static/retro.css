@@ -287,3 +287,13 @@ textarea.comment-box:focus { outline: none; border-color: var(--cyan); }
   #gutter { display: none; }
   #list-pane { border-bottom: 2px solid var(--border); }
 }
+
+/* v0.3 additions */
+.bcard { cursor: grab; }
+.bcard:active { cursor: grabbing; }
+.board-col.drop { outline: 1px dashed var(--green); outline-offset: -4px; background: rgba(61,255,122,.05); }
+.chip-x { color: var(--dim); margin-left: 6px; text-decoration: none; cursor: pointer; }
+.chip-x:hover { color: var(--red, #ff5555); }
+.chip-input { background: transparent; border: none; border-bottom: 1px dashed var(--green); color: var(--green); font: inherit; width: 90px; }
+.diagram img { max-width: 100%; border: 1px solid var(--green-dim, #1d5c38); margin: 6px 0; }
+.link-ext { color: var(--cyan, #5ff); }

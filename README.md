@@ -109,11 +109,16 @@ The mouse works too. We're not monsters.
 - **Field editing covers the common fields only** (priority, assignee, labels,
   due date, components, fix versions, environment, summary). Custom fields are
   read-only — their write payloads are too instance-specific to guess.
-- **Board columns are the statuses present in the sprint**, not the board's
-  configured column layout, and moving a card only works when a transition
-  targets the neighbouring status.
+- **Board columns follow the board's configured layout** when the agile
+  configuration endpoint answers; cards move by workflow transition, so a
+  drop only works when a transition targets a status in that column.
+- **Rank ordering is backlog-only and approximate** — it reuses Jira's rank
+  field via `rankBeforeIssue`; there's no drag-to-position inside a column.
+- **Diagrams are best-effort**: drawio/gliffy/plantuml macros resolve to a
+  same-basename image attachment when one exists; the raw `.drawio` source
+  itself is not rendered (it needs the drawio viewer).
 - **It's a simple client, not a full replacement.** No dashboards, no gadgets,
-  no worklogs, no remote issue links UI. If you need that, go home and use Jira.
+  no sprint reports or burndowns. If you need that, go home and use Jira.
 
 ## Development
 

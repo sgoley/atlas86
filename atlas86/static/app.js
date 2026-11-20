@@ -131,8 +131,9 @@ const state = {
   tab: 'jira',
   jira: { jql: 'assignee = currentUser() ORDER BY updated DESC', issues: [], sel: -1,
           detail: null, mode: 'list', view: 'issues', bulk: false, checked: new Set(),
-          boards: [], board: null, sprints: [], sprint: null, columns: [],
-          group: 'status', bsel: { s: -1, i: -1 } },
+          boards: [], board: null, boardCfg: null, sprints: [], sprint: null,
+          columns: [], group: 'status', bsel: { s: -1, i: -1 },
+          backlog: { sections: [], checked: new Set() } },
   conf: { spaces: [], space: '', pages: [], sel: -1, detail: null, mode: 'list',
           q: '', cql: '', adv: false },
 };
@@ -220,6 +221,7 @@ function switchTab(tab) {
   setStatus(tab === 'jira' ? 'JIRA MODULE LOADED' : tab === 'conf' ? 'CONFLUENCE MODULE LOADED' : 'SETUP / CONFIGURATION');
   if (tab === 'jira') {
     if (state.jira.view === 'boards') renderJiraBoardHead();
+    else if (state.jira.view === 'backlog') renderJiraBacklogHead();
     else { renderJiraListHead(); loadJiraIssues(); }
     loadProjects();
   }
@@ -289,6 +291,7 @@ function renderJiraListHead() {
     <div class="btn-row" style="margin:0">
       <button class="act${state.jira.view === 'issues' ? ' primary' : ''}" data-view="issues">[ ISSUES ]</button>
       <button class="act${state.jira.view === 'boards' ? ' primary' : ''}" data-view="boards">[ BOARDS ]</button>
+      <button class="act${state.jira.view === 'backlog' ? ' primary' : ''}" data-view="backlog">[ BACKLOG ]</button>
     </div>
     <label>QUERY</label>
     <select id="jql-preset">
@@ -311,9 +314,7 @@ function renderJiraListHead() {
       <span class="sub" id="bulk-count">${state.jira.checked.size} SELECTED</span>
     </div>`;
   document.querySelectorAll('#list-head [data-view]').forEach(b =>
-    b.addEventListener('click', () => { state.jira.view = b.dataset.view;
-      if (state.jira.view === 'boards') renderJiraBoardHead();
-      else { renderJiraListHead(); loadJiraIssues(); } }));
+    b.addEventListener('click', () => { state.jira.view = b.dataset.view; routeJiraView(); }));
   $('#jql-preset').addEventListener('change', e => {
     if (!e.target.value) return;
     $('#jql').value = e.target.value;
@@ -451,6 +452,12 @@ function renderJiraDetail() {
       <button class="act danger link-del" data-lid="${esc(l.id)}">[X]</button>
     </div>`).join('');
   const atts = attRowsHtml(it.attachments);
+  const remotes = (it.remote_links || []).map(r => `
+    <div class="link-row">
+      <span class="link-desc">REMOTE</span>
+      <a class="link-ext" href="${esc(r.url || '#')}" target="_blank" rel="noopener">${esc(r.title || r.url || '')}</a>
+      <button class="act danger link-del" data-rid="${esc(r.id)}">[X]</button>
+    </div>`).join('');
   const watches = it.watches || {};
   const votes = it.votes || {};
   const tt = it.timetracking || {};
@@ -499,6 +506,23 @@ function renderJiraDetail() {
         <button id="lk-add" class="act">[ LINK ]</button>
       </div>
     </div>
+    <div class="detail-section"><h2>REMOTE LINKS</h2>
+      <div id="remlinks-list">${remotes || '<div class="sub">NONE.</div>'}</div>
+      <div class="link-add">
+        <input id="rl-url" type="text" placeholder="URL (PAGE / DOC / TICKET)" style="flex:2">
+        <input id="rl-title" type="text" placeholder="TITLE" style="flex:1">
+        <button id="rl-add" class="act">[ ADD ]</button>
+      </div>
+    </div>
+    <div class="detail-section"><h2>WORKLOG</h2>
+      <div id="worklog-list"><div class="sub">LOADING...</div></div>
+      <div class="link-add">
+        <input id="wl-time" type="text" placeholder="TIME (1h 30m)" style="flex:1">
+        <input id="wl-date" type="date">
+        <input id="wl-comment" type="text" placeholder="COMMENT" style="flex:2">
+        <button id="wl-add" class="act">[ LOG ]</button>
+      </div>
+    </div>
     <div class="detail-section"><h2>ATTACHMENTS</h2>
       ${atts || '<div class="sub">NO ATTACHMENTS.</div>'}
       <div class="btn-row"><button id="att-upload" class="act">[ ATTACH FILE ]</button></div>
@@ -508,6 +532,7 @@ function renderJiraDetail() {
         <button id="d-watch" class="act">[ ${watches.isWatching ? 'UNWATCH' : 'WATCH'} ]</button>
         <button id="d-vote" class="act" ${votes.hasVoted ? 'disabled' : ''}>[ VOTE${votes.votes ? ' (' + votes.votes + ')' : ''} ]</button>
         <button id="d-fields" class="act">[ EDIT FIELDS ]</button>
+        <button id="d-subtask" class="act">[ SUBTASK ]</button>
         <button id="d-edit" class="act primary">[ E / EDIT ]</button>
         <button id="d-back" class="act">[ ESC / BACK ]</button>
         <button id="d-del" class="act danger">[ D / DELETE ]</button>
@@ -531,7 +556,12 @@ function renderJiraDetail() {
   document.querySelectorAll('.link-key').forEach(a =>
     a.addEventListener('click', () => openJiraIssue(a.dataset.key)));
   document.querySelectorAll('.link-del').forEach(b =>
-    b.addEventListener('click', () => deleteLink(b.dataset.lid)));
+    b.addEventListener('click', () => b.dataset.rid
+      ? deleteRemoteLink(b.dataset.rid) : deleteLink(b.dataset.lid)));
+  $('#rl-add').onclick = addRemoteLink;
+  $('#wl-add').onclick = addWorklog;
+  $('#d-subtask').onclick = newSubtask;
+  loadWorklogs(it.key);
   loadLinkTypes(it.key);
 }
 
@@ -600,6 +630,77 @@ async function voteIssue(key) {
   await api('/api/jira/issue/' + encodeURIComponent(key) + '/vote', { method: 'POST', body: {} });
   toast('VOTE CAST', 'ok'); blip(1320, .05);
   await openJiraIssue(key);
+}
+
+async function loadWorklogs(key) {
+  const box = $('#worklog-list');
+  if (!box) return;
+  try {
+    const d = await api('/api/jira/issue/' + encodeURIComponent(key) + '/worklog');
+    const ws = d.worklogs || [];
+    box.innerHTML = ws.map(w => `
+      <div class="link-row">
+        <span class="link-desc">${esc(w.timeSpent || '')}</span>
+        <span class="link-sum">${esc(w.author || '')} · ${esc((w.started || '').slice(0, 10))}${w.comment ? ' · ' + esc(w.comment) : ''}</span>
+      </div>`).join('') || '<div class="sub">NO WORK LOGGED.</div>';
+  } catch (e) { box.innerHTML = '<div class="sub">WORKLOG UNAVAILABLE</div>'; }
+}
+
+async function addWorklog() {
+  const it = state.jira.detail;
+  const time = ($('#wl-time') || {}).value.trim();
+  if (!time) { toast('ENTER TIME (e.g. 1h 30m)', 'err'); return; }
+  const body = { timeSpent: time };
+  const d = ($('#wl-date') || {}).value;
+  if (d) body.started = d + 'T12:00:00.000+0000';
+  const c = ($('#wl-comment') || {}).value.trim();
+  if (c) body.comment = c;
+  await api('/api/jira/issue/' + encodeURIComponent(it.key) + '/worklog',
+    { method: 'POST', body });
+  toast('WORK LOGGED', 'ok'); blip(1200, .04);
+  loadWorklogs(it.key);
+  $('#wl-time').value = ''; $('#wl-comment').value = '';
+}
+
+async function addRemoteLink() {
+  const it = state.jira.detail;
+  const url = ($('#rl-url') || {}).value.trim();
+  if (!url) { toast('ENTER A URL', 'err'); return; }
+  await api('/api/jira/issue/' + encodeURIComponent(it.key) + '/remlink',
+    { method: 'POST', body: { url, title: ($('#rl-title') || {}).value.trim() } });
+  toast('REMOTE LINK ADDED', 'ok');
+  await openJiraIssue(it.key);
+}
+
+async function deleteRemoteLink(rid) {
+  const it = state.jira.detail;
+  await api('/api/jira/issue/' + encodeURIComponent(it.key) + '/remlink/' + encodeURIComponent(rid),
+    { method: 'DELETE' });
+  toast('REMOTE LINK REMOVED', 'ok');
+  await openJiraIssue(it.key);
+}
+
+function newSubtask() {
+  const it = state.jira.detail;
+  if (!it) return;
+  const project = (it.key || '').split('-')[0];
+  openEditor({
+    title: true, titleValue: '',
+    fieldsHTML: `
+      <label>PARENT</label>
+      <input type="text" value="${esc(it.key)}" disabled>
+      <label>TYPE</label>
+      <input type="text" value="Sub-task" disabled>`,
+    html: '',
+    onSave: async ed => {
+      if (!ed.title) { toast('SUMMARY REQUIRED', 'err'); throw new Error('validation'); }
+      const d = await api('/api/jira/issue', { method: 'POST',
+        body: { project, issuetype: 'Sub-task', parent: it.key,
+                summary: ed.title, description_html: ed.html } });
+      toast('SUBTASK FILED: ' + d.key, 'ok');
+      await openJiraIssue(it.key);
+    },
+  });
 }
 
 async function editJiraFields() {
@@ -750,6 +851,13 @@ async function loadProjects() {
   if (state.tab === 'jira' && state.jira.view === 'boards') renderJiraBoardHead();
 }
 
+function routeJiraView() {
+  const v = state.jira.view;
+  if (v === 'boards') renderJiraBoardHead();
+  else if (v === 'backlog') { renderJiraBacklogHead(); renderBacklog(); }
+  else { renderJiraListHead(); loadJiraIssues(); }
+}
+
 /* ============ JIRA BOARDS ============ */
 function renderJiraBoardHead() {
   const j = state.jira;
@@ -763,6 +871,7 @@ function renderJiraBoardHead() {
     <div class="btn-row" style="margin:0">
       <button class="act" data-view="issues">[ ISSUES ]</button>
       <button class="act primary" data-view="boards">[ BOARDS ]</button>
+      <button class="act" data-view="backlog">[ BACKLOG ]</button>
     </div>
     <label>PROJECT</label>
     <select id="b-project"><option value="">— ALL PROJECTS —</option>${projOpts}</select>
@@ -773,11 +882,12 @@ function renderJiraBoardHead() {
     <div class="btn-row">
       <button id="b-load" class="act primary">[ LOAD BOARD ]</button>
       <button id="b-group" class="act">[ GROUP: ${j.group.toUpperCase()} ]</button>
+      ${j.board ? `<button id="b-newsprint" class="act">[ NEW SPRINT ]</button>
+      ${j.sprint && j.sprint.state === 'future' ? '<button id="b-start" class="act">[ START ]</button>' : ''}
+      ${j.sprint && j.sprint.state === 'active' ? '<button id="b-close" class="act">[ COMPLETE ]</button>' : ''}` : ''}
     </div>`;
   document.querySelectorAll('#list-head [data-view]').forEach(b =>
-    b.addEventListener('click', () => { state.jira.view = b.dataset.view;
-      if (state.jira.view === 'boards') renderJiraBoardHead();
-      else { renderJiraListHead(); loadJiraIssues(); } }));
+    b.addEventListener('click', () => { state.jira.view = b.dataset.view; routeJiraView(); }));
   $('#b-project').addEventListener('change', async e => {
     j.boardProject = e.target.value;
     j.board = null; j.sprints = []; j.sprint = null; j.columns = [];
@@ -810,6 +920,39 @@ function renderJiraBoardHead() {
     j.group = j.group === 'status' ? 'epic' : 'status';
     if (j.sprint) loadBoard(); else renderJiraBoardHead();
   });
+  const ns = $('#b-newsprint');
+  if (ns) ns.onclick = async () => {
+    const name = prompt('NEW SPRINT NAME');
+    if (!name) return;
+    try {
+      await api('/api/jira/sprints', { method: 'POST',
+        body: { name, board_id: j.board.id } });
+      toast('SPRINT CREATED', 'ok'); blip(1320, .05);
+      j.sprints = await api('/api/jira/boards/' + encodeURIComponent(j.board.id) + '/sprints');
+      renderJiraBoardHead();
+    } catch (e) { /* toast shown */ }
+  };
+  const st = $('#b-start');
+  if (st) st.onclick = () => sprintState('active');
+  const cl = $('#b-close');
+  if (cl) cl.onclick = () => sprintState('closed');
+}
+
+async function sprintState(state_) {
+  const j = state.jira;
+  if (!j.sprint) return;
+  if (state_ === 'closed' &&
+      !(await confirmDialog('[ COMPLETE ] SPRINT',
+        'COMPLETE ' + j.sprint.name + '? UNFINISHED ISSUES RETURN TO THE BACKLOG.'))) return;
+  try {
+    await api('/api/jira/sprints/' + encodeURIComponent(j.sprint.id) + '/state',
+      { method: 'POST', body: { state: state_ } });
+    toast('SPRINT ' + state_.toUpperCase(), 'ok');
+    j.sprints = await api('/api/jira/boards/' + encodeURIComponent(j.board.id) + '/sprints');
+    j.sprint = j.sprints.find(s => String(s.id) === String(j.sprint.id)) || j.sprint;
+    renderJiraBoardHead();
+    if (j.sprint) await loadBoard();
+  } catch (e) { /* toast shown */ }
 }
 
 async function loadBoard() {
@@ -818,18 +961,67 @@ async function loadBoard() {
   setStatus('LOADING SPRINT BOARD...');
   try {
     const cards = await api('/api/jira/sprints/' + encodeURIComponent(j.sprint.id) + '/issues');
-    const cols = new Map();
-    for (const c of cards) {
-      const s = j.group === 'epic' ? (c.epic || 'NO EPIC') : (c.status || 'UNKNOWN');
-      if (!cols.has(s)) cols.set(s, []);
-      cols.get(s).push(c);
+    let cfgCols = null;
+    if (j.group === 'status') {
+      if (!j.boardCfg || String(j.boardCfg.id) !== String(j.board && j.board.id)) {
+        try { j.boardCfg = await api('/api/jira/boards/' + encodeURIComponent(j.board.id) + '/configuration'); }
+        catch (e) { j.boardCfg = { columns: [] }; }
+      }
+      cfgCols = j.boardCfg.columns || [];
     }
-    j.columns = [...cols.entries()].map(([name, issues]) => ({ name, issues }));
+    j.columns = buildColumns(cards, j.group, cfgCols);
     j.bsel = { s: -1, i: -1 };
     renderBoard();
     setStatus(j.columns.reduce((n, c) => n + c.issues.length, 0) + ' CARD(S) ON BOARD');
     blip(1200, .04);
   } catch (e) { /* toast shown */ }
+}
+
+function buildColumns(cards, group, cfgCols) {
+  if (group === 'epic') {
+    const cols = new Map();
+    for (const c of cards) {
+      const s = c.epic || 'NO EPIC';
+      if (!cols.has(s)) cols.set(s, []);
+      cols.get(s).push(c);
+    }
+    return [...cols.entries()].map(([name, issues]) =>
+      ({ name, issues, statusNames: [] }));
+  }
+  // status grouping uses the board's configured columns when available
+  const colOf = card => {
+    const sid = String(card.status_id || ''), sname = (card.status || '').toLowerCase();
+    for (const col of cfgCols || []) {
+      if ((col.statuses || []).some(s => String(s.id) === sid ||
+          (s.name || '').toLowerCase() === sname)) return col.name;
+    }
+    return null;
+  };
+  const out = [], idx = new Map(), other = [];
+  for (const col of cfgCols || []) {
+    const name = col.name || 'COLUMN';
+    idx.set(name, out.length);
+    out.push({ name, issues: [],
+      statusNames: (col.statuses || []).map(s => (s.name || '').toLowerCase()) });
+  }
+  for (const c of cards) {
+    const name = colOf(c);
+    if (name != null && idx.has(name)) out[idx.get(name)].issues.push(c);
+    else other.push(c);
+  }
+  if (!cfgCols || !cfgCols.length) {
+    // no config: distinct statuses, first-seen order
+    const cols = new Map();
+    for (const c of cards) {
+      const s = c.status || 'UNKNOWN';
+      if (!cols.has(s)) cols.set(s, []);
+      cols.get(s).push(c);
+    }
+    return [...cols.entries()].map(([name, issues]) =>
+      ({ name, issues, statusNames: [name.toLowerCase()] }));
+  }
+  if (other.length) out.push({ name: 'OTHER', issues: other, statusNames: [] });
+  return out;
 }
 
 function boardFlat() {
@@ -853,17 +1045,57 @@ function renderBoard() {
       <div class="board-col">
         <div class="board-col-head">${esc(c.name)} <span class="board-count">${c.issues.length}</span></div>
         ${c.issues.map((card, i) => `
-          <div class="bcard${j.bsel.s === s && j.bsel.i === i ? ' sel' : ''}" data-s="${s}" data-i="${i}">
+          <div class="bcard${j.bsel.s === s && j.bsel.i === i ? ' sel' : ''}" data-s="${s}" data-i="${i}" draggable="true">
             <div class="bcard-key">${esc(card.key)}</div>
             <div class="bcard-sum">${esc(card.summary)}</div>
             <div class="bcard-meta">${esc(card.assignee || '—')}${card.points ? ' · ' + esc(card.points) + 'pt' : ''}</div>
           </div>`).join('')}
       </div>`).join('')}
     </div>`;
-  document.querySelectorAll('.bcard').forEach(el => el.addEventListener('click', () => {
-    j.bsel = { s: +el.dataset.s, i: +el.dataset.i };
-    openJiraIssue(j.columns[j.bsel.s].issues[j.bsel.i].key);
-  }));
+  document.querySelectorAll('.bcard').forEach(el => {
+    el.addEventListener('click', () => {
+      j.bsel = { s: +el.dataset.s, i: +el.dataset.i };
+      openJiraIssue(j.columns[j.bsel.s].issues[j.bsel.i].key);
+    });
+    el.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/plain',
+        JSON.stringify({ s: +el.dataset.s, i: +el.dataset.i }));
+      e.dataTransfer.effectAllowed = 'move';
+    });
+  });
+  document.querySelectorAll('.board-col').forEach((col, ns) => {
+    col.addEventListener('dragover', e => { e.preventDefault(); col.classList.add('drop'); });
+    col.addEventListener('dragleave', () => col.classList.remove('drop'));
+    col.addEventListener('drop', async e => {
+      e.preventDefault(); col.classList.remove('drop');
+      try {
+        const { s, i } = JSON.parse(e.dataTransfer.getData('text/plain'));
+        await moveCardToColumn(s, i, ns);
+      } catch (err) { /* bad payload */ }
+    });
+  });
+}
+
+async function moveCardToColumn(s, i, ns) {
+  const j = state.jira;
+  if (j.group === 'epic') { toast('EPIC SWIMLANES: MOVE DISABLED', 'info'); return; }
+  if (s === ns || !j.columns[s] || !j.columns[ns]) return;
+  const card = j.columns[s].issues[i];
+  const target = j.columns[ns];
+  const names = (target.statusNames && target.statusNames.length
+    ? target.statusNames : [target.name.toLowerCase()]);
+  try {
+    const d = await api('/api/jira/issue/' + encodeURIComponent(card.key));
+    const t = (d.transitions || []).find(x =>
+      names.includes((x.to || '').toLowerCase()) ||
+      names.includes((x.name || '').toLowerCase()));
+    if (!t) { toast('NO TRANSITION TO ' + target.name.toUpperCase(), 'err'); return; }
+    await api('/api/jira/issue/' + encodeURIComponent(card.key), {
+      method: 'PUT', body: { transition_id: t.id },
+    });
+    toast(card.key + ' → ' + target.name, 'ok'); blip(1200, .04);
+    await loadBoard();
+  } catch (e) { /* toast shown */ }
 }
 
 async function moveBoardCard(dir) {
@@ -873,19 +1105,148 @@ async function moveBoardCard(dir) {
   if (s < 0 || i < 0 || !j.columns[s]) return;
   const ns = s + dir;
   if (ns < 0 || ns >= j.columns.length) { toast('EDGE OF BOARD', 'info'); return; }
-  const card = j.columns[s].issues[i];
-  const target = j.columns[ns].name;
+  await moveCardToColumn(s, i, ns);
+}
+
+/* ============ JIRA BACKLOG ============ */
+function renderJiraBacklogHead() {
+  const j = state.jira;
+  const projOpts = (state.projects || []).map(p =>
+    `<option value="${esc(p.key)}"${p.key === j.boardProject ? ' selected' : ''}>${esc(p.key)} — ${esc(p.name)}</option>`).join('');
+  const boardOpts = j.boards.map(b =>
+    `<option value="${b.id}"${String(b.id) === String(j.board && j.board.id) ? ' selected' : ''}>${esc(b.name)}</option>`).join('');
+  const sprintOpts = j.sprints.filter(s => s.state !== 'closed').map(s =>
+    `<option value="${s.id}">${esc(s.name)} [${esc(s.state || '')}]</option>`).join('');
+  $('#list-head').innerHTML = `
+    <div class="btn-row" style="margin:0">
+      <button class="act" data-view="issues">[ ISSUES ]</button>
+      <button class="act" data-view="boards">[ BOARDS ]</button>
+      <button class="act primary" data-view="backlog">[ BACKLOG ]</button>
+    </div>
+    <label>PROJECT</label>
+    <select id="bl-project"><option value="">— ALL PROJECTS —</option>${projOpts}</select>
+    <label>BOARD</label>
+    <select id="bl-board"><option value="">— PICK PROJECT FIRST —</option>${boardOpts}</select>
+    <label>TARGET SPRINT</label>
+    <select id="bl-sprint"><option value="">— BACKLOG —</option>${sprintOpts}</select>
+    <div class="btn-row">
+      <button id="bl-load" class="act primary">[ LOAD BACKLOG ]</button>
+      <button id="bl-tosprint" class="act">[ → SPRINT ]</button>
+      <button id="bl-tobacklog" class="act">[ → BACKLOG ]</button>
+    </div>
+    <div class="btn-row" style="margin:0">
+      <span class="sub" id="bl-count">${j.backlog.checked.size} SELECTED</span>
+    </div>`;
+  document.querySelectorAll('#list-head [data-view]').forEach(b =>
+    b.addEventListener('click', () => { state.jira.view = b.dataset.view; routeJiraView(); }));
+  $('#bl-project').addEventListener('change', async e => {
+    j.boardProject = e.target.value;
+    j.board = null; j.sprints = []; j.backlog.sections = [];
+    try {
+      j.boards = await api('/api/jira/boards?project=' + encodeURIComponent(j.boardProject));
+    } catch (err) { j.boards = []; }
+    renderJiraBacklogHead();
+  });
+  $('#bl-board').addEventListener('change', async e => {
+    j.board = j.boards.find(b => String(b.id) === e.target.value) || null;
+    j.sprints = []; j.backlog.sections = [];
+    if (!j.board) { renderJiraBacklogHead(); return; }
+    try {
+      j.sprints = await api('/api/jira/boards/' + encodeURIComponent(j.board.id) + '/sprints');
+      renderJiraBacklogHead();
+      await loadBacklog();
+    } catch (err) { /* toast shown */ }
+  });
+  $('#bl-load').addEventListener('click', loadBacklog);
+  $('#bl-tosprint').addEventListener('click', () => moveChecked('sprint'));
+  $('#bl-tobacklog').addEventListener('click', () => moveChecked('backlog'));
+}
+
+async function loadBacklog() {
+  const j = state.jira;
+  if (!j.board) { toast('PICK A BOARD FIRST', 'err'); return; }
+  setStatus('LOADING BACKLOG...');
   try {
-    const d = await api('/api/jira/issue/' + encodeURIComponent(card.key));
-    const t = (d.transitions || []).find(x =>
-      (x.to || '').toLowerCase() === target.toLowerCase() ||
-      (x.name || '').toLowerCase() === target.toLowerCase());
-    if (!t) { toast('NO TRANSITION TO ' + target.toUpperCase(), 'err'); return; }
-    await api('/api/jira/issue/' + encodeURIComponent(card.key), {
-      method: 'PUT', body: { transition_id: t.id },
-    });
-    toast(card.key + ' → ' + target, 'ok'); blip(1200, .04);
-    await loadBoard();
+    const bid = encodeURIComponent(j.board.id);
+    const [backlog, sprints] = await Promise.all([
+      api('/api/jira/boards/' + bid + '/backlog'),
+      api('/api/jira/boards/' + bid + '/sprints'),
+    ]);
+    j.sprints = sprints || [];
+    const open = j.sprints.filter(s => s.state !== 'closed');
+    const sections = await Promise.all(open.map(async s => ({
+      kind: 'sprint', id: s.id, name: s.name + ' [' + (s.state || '') + ']',
+      issues: await api('/api/jira/sprints/' + encodeURIComponent(s.id) + '/issues'),
+    })));
+    sections.push({ kind: 'backlog', id: null, name: 'BACKLOG', issues: backlog || [] });
+    j.backlog.sections = sections;
+    j.backlog.checked.clear();
+    renderBacklog();
+    renderJiraBacklogHead();
+    setStatus('BACKLOG LOADED');
+    blip(1200, .04);
+  } catch (e) { renderBacklog(); }
+}
+
+function renderBacklog() {
+  const j = state.jira;
+  const secs = j.backlog.sections;
+  if (!secs.length) {
+    $('#detail-body').innerHTML = '<div class="empty">NO BACKLOG LOADED. PICK PROJECT → BOARD.</div>';
+    return;
+  }
+  $('#detail-body').innerHTML = secs.map((sec, si) => `
+    <div class="detail-section">
+      <h2>${esc(sec.name)} <span class="sub">(${sec.issues.length})</span></h2>
+      ${sec.issues.map((c, i) => `
+        <div class="link-row bl-row" data-si="${si}" data-i="${i}">
+          <input type="checkbox" class="ck" data-key="${esc(c.key)}"${j.backlog.checked.has(c.key) ? ' checked' : ''}>
+          <a class="link-key" data-key="${esc(c.key)}">${esc(c.key)}</a>
+          <span class="link-sum">${esc(c.summary)} · ${esc(c.status || '')}</span>
+          ${sec.kind === 'backlog' ? `<button class="act bl-rank" data-dir="-1" data-si="${si}" data-i="${i}">[↑]</button>
+          <button class="act bl-rank" data-dir="1" data-si="${si}" data-i="${i}">[↓]</button>` : ''}
+        </div>`).join('') || '<div class="sub">EMPTY.</div>'}
+    </div>`).join('');
+  document.querySelectorAll('.bl-row .link-key').forEach(a =>
+    a.addEventListener('click', () => openJiraIssue(a.dataset.key)));
+  document.querySelectorAll('.bl-row .ck').forEach(c => c.addEventListener('click', e => {
+    e.stopPropagation();
+    c.checked ? j.backlog.checked.add(c.dataset.key) : j.backlog.checked.delete(c.dataset.key);
+    renderJiraBacklogHead();
+  }));
+  document.querySelectorAll('.bl-rank').forEach(b => b.addEventListener('click', async e => {
+    e.stopPropagation();
+    const si = +b.dataset.si, i = +b.dataset.i, dir = +b.dataset.dir;
+    const issues = secs[si].issues;
+    const before = dir < 0 ? (issues[i - 1] || {}).key
+      : (issues[i + 2] || {}).key;  // skip self + next
+    if (!before) { toast(dir < 0 ? 'ALREADY TOP' : 'ALREADY BOTTOM', 'info'); return; }
+    try {
+      await api('/api/jira/issues/rank', { method: 'POST',
+        body: { keys: [issues[i].key], before } });
+      toast(issues[i].key + ' RANKED', 'ok');
+      await loadBacklog();
+    } catch (err) { /* toast shown */ }
+  }));
+}
+
+async function moveChecked(kind) {
+  const j = state.jira;
+  const keys = [...j.backlog.checked];
+  if (!keys.length) { toast('NOTHING SELECTED', 'err'); return; }
+  try {
+    if (kind === 'sprint') {
+      const sid = ($('#bl-sprint') || {}).value;
+      if (!sid) { toast('PICK A TARGET SPRINT', 'err'); return; }
+      await api('/api/jira/sprints/' + encodeURIComponent(sid) + '/issues',
+        { method: 'POST', body: { keys } });
+      toast(keys.length + ' ISSUE(S) → SPRINT', 'ok');
+    } else {
+      await api('/api/jira/backlog/issues', { method: 'POST', body: { keys } });
+      toast(keys.length + ' ISSUE(S) → BACKLOG', 'ok');
+    }
+    blip(1200, .04);
+    await loadBacklog();
   } catch (e) { /* toast shown */ }
 }
 
@@ -985,17 +1346,28 @@ function renderConfDetail() {
     `<a class="crumb" data-id="${esc(a.id)}">${esc(a.title)}</a>`).join(' / ');
   const children = (p.children || []).map(c =>
     `<div class="link-row"><a class="link-key" data-id="${esc(c.id)}">${esc(c.title)}</a></div>`).join('');
-  const labels = (p.labels || []).map(l => `<span class="chip">${esc(l)}</span>`).join(' ');
+  const labels = (p.labels || []).map(l =>
+    `<span class="chip">${esc(l)}<a class="chip-x" data-label="${esc(l)}">×</a></span>`).join(' ');
   const atts = attRowsHtml(p.attachments);
+  const diagrams = (p.diagrams || []).map(d => d.image
+    ? `<div class="diagram"><div class="sub">${esc(d.name)}</div><img src="${esc(d.url)}" loading="lazy"></div>`
+    : `<div class="link-row"><span class="link-desc">DIAGRAM</span><a class="link-key" href="${esc(d.url)}">${esc(d.name)}</a></div>`).join('');
   $('#detail-body').innerHTML = `
     <div class="detail-head">
       <h1>${esc(p.title)}</h1>
       <div class="sub">SPACE ${esc(p.space)} (${esc(p.space_name || '')}) · VERSION ${esc(p.version)}</div>
       ${crumbs ? `<div class="crumbs">ROOT / ${crumbs} / <b>${esc(p.title)}</b></div>` : ''}
-      ${labels ? `<div class="chips-row">${labels}</div>` : ''}
+      <div class="chips-row">${labels}<input id="label-add" type="text" placeholder="+ LABEL" class="chip-input"></div>
+      <div class="btn-row" style="margin-top:4px">
+        <button id="pg-move" class="act">[ MOVE ]</button>
+        <button id="pg-copy" class="act">[ COPY ]</button>
+        <button id="pg-restr" class="act">[ RESTRICTIONS ]</button>
+      </div>
+      <div id="restr-box"></div>
     </div>
     <div class="detail-section"><h2>CONTENT</h2>
       <div class="detail-body-html">${p.body_html || '<i>(empty)</i>'}</div></div>
+    ${diagrams ? `<div class="detail-section"><h2>DIAGRAMS</h2>${diagrams}</div>` : ''}
     ${children ? `<div class="detail-section"><h2>CHILD PAGES</h2>${children}</div>` : ''}
     <div class="detail-section"><h2>ATTACHMENTS</h2>
       ${atts || '<div class="sub">NO ATTACHMENTS.</div>'}
@@ -1011,6 +1383,46 @@ function renderConfDetail() {
   $('#d-edit').onclick = editConfPage;
   $('#d-back').onclick = backToList;
   $('#d-del').onclick = deleteConfPage;
+  document.querySelectorAll('.chip-x').forEach(x => x.addEventListener('click', async () => {
+    await api('/api/confluence/page/' + encodeURIComponent(p.id) + '/label?name=' +
+      encodeURIComponent(x.dataset.label), { method: 'DELETE' });
+    toast('LABEL REMOVED', 'ok');
+    await openConfPage(p.id);
+  }));
+  $('#label-add').addEventListener('keydown', async e => {
+    if (e.key !== 'Enter' || !e.target.value.trim()) return;
+    await api('/api/confluence/page/' + encodeURIComponent(p.id) + '/label',
+      { method: 'POST', body: { name: e.target.value.trim() } });
+    toast('LABEL ADDED', 'ok');
+    await openConfPage(p.id);
+  });
+  $('#pg-move').onclick = async () => {
+    const parent = prompt('NEW PARENT PAGE ID (BLANK = ROOT)', '');
+    if (parent === null) return;
+    await api('/api/confluence/page/' + encodeURIComponent(p.id) + '/move',
+      { method: 'PUT', body: { space: p.space, parent_id: parent || null } });
+    toast('PAGE MOVED', 'ok');
+    await openConfPage(p.id);
+  };
+  $('#pg-copy').onclick = async () => {
+    const title = prompt('COPY TITLE', p.title + ' (copy)');
+    if (title === null) return;
+    const d = await api('/api/confluence/page/' + encodeURIComponent(p.id) + '/copy',
+      { method: 'POST', body: { title, space: p.space } });
+    toast('PAGE COPIED: ' + (d.id || ''), 'ok');
+  };
+  $('#pg-restr').onclick = async () => {
+    const rb = $('#restr-box');
+    if (rb.dataset.loaded) { rb.innerHTML = ''; delete rb.dataset.loaded; return; }
+    try {
+      const r = await api('/api/confluence/page/' + encodeURIComponent(p.id) + '/restrictions');
+      rb.innerHTML = r.length
+        ? '<div class="chips-row">' + r.map(x =>
+            `<span class="chip">${esc(x.type || 'READ')}: ${esc(x.name || '')}</span>`).join('') + '</div>'
+        : '<div class="sub">NO READ RESTRICTIONS.</div>';
+      rb.dataset.loaded = '1';
+    } catch (e) { rb.innerHTML = '<div class="sub">RESTRICTIONS UNAVAILABLE</div>'; }
+  };
   wireAttachments('/api/confluence/page/' + encodeURIComponent(p.id) + '/attachment');
   document.querySelectorAll('.crumb, .link-key[data-id]').forEach(a =>
     a.addEventListener('click', () => openConfPage(a.dataset.id)));
@@ -1138,6 +1550,7 @@ function backToList() {
   s.mode = 'list'; s.detail = null;
   if (state.tab === 'jira') {
     if (state.jira.view === 'boards') { renderBoard(); }
+    else if (state.jira.view === 'backlog') { renderBacklog(); }
     else { renderJiraDetailEmpty(); loadJiraIssues(); }
   }
   else { renderConfDetailEmpty(); loadConfPages(); }
