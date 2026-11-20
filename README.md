@@ -74,22 +74,46 @@ back to the browser or logged.
 | `ctrl-s`   | Save                            |
 | `esc`      | Back / exit edit                |
 | `?`        | Help overlay                    |
+| `[` `]`    | On a board: move card a column (fires the matching transition) |
+| `r`        | On a board: reload the sprint   |
 
 The mouse works too. We're not monsters.
+
+## What it does
+
+- **Jira**: JQL search with presets + saved filters, full issue detail (every
+  field, rendered generically), edit summary/description, edit priority /
+  assignee / labels / due date / components / fix versions, transitions,
+  comments, issue links, watchers, votes, attachments (view inline + upload),
+  epic/parent/child hierarchy.
+- **Boards**: pick project → board → sprint, cards grouped by status;
+  `[`/`]` moves a card to the adjacent column via the matching transition.
+- **Confluence**: space browse + title search + raw CQL, page tree
+  (ancestors/children), labels, version history, attachments (inline images +
+  upload), WYSIWYG edit.
+- **Fast**: TTL-cached reads (~0.3ms warm vs ~50ms+ cold upstream),
+  virtualized lists. See `docs/PERF.md`.
 
 ## Known limits
 
 - **Confluence pages with complex macros**: editing a page that uses macros
   (Jira issues, children display, etc.) and saving will drop them. atlas86
   round-trips the HTML storage format and doesn't model macro storage XML.
-  Read-only? Totally fine. Write? Expect casualties.
+  Read-only? Totally fine — `body.view` renders most macros for you. Write?
+  Expect casualties.
 - **Jira markup differs by platform**: on Server/DC, descriptions are written
   as wiki markup; on Cloud they're written as ADF (Atlassian Document Format).
   Read back in, it all becomes HTML either way.
 - **Tables in Jira descriptions flatten to paragraphs** on save. Cells lose
   their grid.
-- **It's a simple client, not a full replacement.** No dashboards, no agile
-  boards, no gadgets, no attachments. If you need that, go home and use Jira.
+- **Field editing covers the common fields only** (priority, assignee, labels,
+  due date, components, fix versions, environment, summary). Custom fields are
+  read-only — their write payloads are too instance-specific to guess.
+- **Board columns are the statuses present in the sprint**, not the board's
+  configured column layout, and moving a card only works when a transition
+  targets the neighbouring status.
+- **It's a simple client, not a full replacement.** No dashboards, no gadgets,
+  no worklogs, no remote issue links UI. If you need that, go home and use Jira.
 
 ## Development
 

@@ -67,6 +67,43 @@ Never return the token.
 - `DELETE /api/confluence/page/<id>` -> `{ok:true}`
 - `GET  /` -> templates/index.html. `/static/*` normal Flask static.
 
+## v0.2 API extensions (intentionally added; same error/JSON rules)
+
+Reads are TTL-cached server-side (30–300s depending on endpoint); every
+mutation clears the cache.
+
+- `GET  /api/jira/issue/<key>` now also returns: `priority`, `created`,
+  `duedate`, `labels`, `components`, `fixVersions`, `parent`, `epic`,
+  `children` (epics only), `subtasks`, `links`, `attachments` (each with a
+  proxy `url`), `watches`, `votes`, `timetracking`, and `attributes` covering
+  ALL remaining fields generically (dicts→name/value/displayName/key, ADF→text
+  via `convert.adf_to_text`, values truncated at 240 chars).
+- `GET  /api/jira/issue/<key>/editmeta` -> allowedValues per field (trimmed)
+- `GET  /api/jira/users?q=` -> `[{accountId,name,displayName,email}]`
+- `PUT  /api/jira/issue/<key>` accepts `fields` = friendly-name map:
+  `priority{name}`, `duedate`, `labels[]`, `components[{name}]`,
+  `fixVersions[{name}]`, `environment`, `summary`, `assignee{name|accountId}`.
+- `POST /api/jira/transition` `{keys:[], transition_id}` -> bulk transition
+- `GET|POST|DELETE /api/jira/issue/<key>/watchers` (+ `?accountId=` on DELETE)
+- `POST /api/jira/issue/<key>/vote`
+- `GET  /api/jira/issue/<key>/linktypes`
+- `POST /api/jira/issue/<key>/link` `{type, other, direction}` or explicit
+  `{type, inwardIssue, outwardIssue}`
+- `DELETE /api/jira/issue/<key>/link/<link_id>`
+- `GET  /api/jira/attachment/<aid>` -> proxied bytes (images inline-safe)
+- `POST /api/jira/issue/<key>/attachment` (multipart `file`)
+- `GET  /api/jira/boards?project=` -> `[{id,name,type,project}]` (agile API)
+- `GET  /api/jira/boards/<id>/sprints?state=` -> `[{id,name,state,...}]`
+- `GET  /api/jira/sprints/<id>/issues` -> `[{key,summary,status,status_id,
+  issuetype,assignee,priority,points,epic,updated}]`
+- `GET  /api/confluence/page/<id>` now also returns `ancestors`, `children`,
+  `labels`, `attachments` (each with proxy `url`).
+- `GET  /api/confluence/page/<id>/history` -> `[{number,when,by,message}]`
+- `GET  /api/confluence/cql?cql=&limit=` -> `{pages:[...]}` raw CQL passthrough
+- `GET  /api/confluence/attachment?dl=<_links.download path>` -> proxied bytes;
+  path must start `/download/` (400 otherwise). Images served inline.
+- `POST /api/confluence/page/<id>/attachment` (multipart `file`)
+
 ## Body format rules (the important part)
 `body_html`/`description_html` is the editor's HTML subset:
 `p br hr h1-h6 strong b em i u s del code pre ul ol li a[href] blockquote

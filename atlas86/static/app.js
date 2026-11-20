@@ -130,9 +130,9 @@ const state = {
   configured: false,
   tab: 'jira',
   jira: { jql: 'assignee = currentUser() ORDER BY updated DESC', issues: [], sel: -1,
-          detail: null, mode: 'list', view: 'issues',
+          detail: null, mode: 'list', view: 'issues', bulk: false, checked: new Set(),
           boards: [], board: null, sprints: [], sprint: null, columns: [],
-          bsel: { s: -1, i: -1 } },
+          group: 'status', bsel: { s: -1, i: -1 } },
   conf: { spaces: [], space: '', pages: [], sel: -1, detail: null, mode: 'list',
           q: '', cql: '', adv: false },
 };
@@ -303,7 +303,12 @@ function renderJiraListHead() {
     <div class="btn-row">
       <button id="jrun" class="act primary">[ RUN QUERY ]</button>
       <button id="jsave" class="act">[ SAVE JQL ]</button>
+      <button id="jbulk" class="act${state.jira.bulk ? ' primary' : ''}">[ BULK ]</button>
       <button id="jnew" class="act">[ NEW ISSUE ]</button>
+    </div>
+    <div class="btn-row" id="bulk-bar" ${state.jira.bulk ? '' : 'hidden'} style="margin:0">
+      <button id="bulk-trans" class="act primary">[ TRANSITION SELECTED ]</button>
+      <span class="sub" id="bulk-count">${state.jira.checked.size} SELECTED</span>
     </div>`;
   document.querySelectorAll('#list-head [data-view]').forEach(b =>
     b.addEventListener('click', () => { state.jira.view = b.dataset.view;
@@ -325,6 +330,11 @@ function renderJiraListHead() {
     localStorage.setItem('a86.jql.saved', JSON.stringify(list));
     renderJiraListHead();
     toast('FILTER SAVED', 'ok');
+  });
+  $('#jbulk').addEventListener('click', () => {
+    state.jira.bulk = !state.jira.bulk;
+    if (!state.jira.bulk) state.jira.checked.clear();
+    renderJiraListHead(); renderJiraRows();
   });
   $('#jnew').addEventListener('click', newJiraIssue);
 }
@@ -359,8 +369,10 @@ async function loadJiraIssues() {
 function renderJiraRows() {
   const b = box(), items = state.jira.issues;
   if (!items.length) { b.innerHTML = '<div class="empty">NO TICKETS. TRY ANOTHER JQL.</div>'; return; }
+  const bulk = state.jira.bulk;
   vlistRender(b, items, state.jira.sel, (it, i) => `
     <div class="row${i === state.jira.sel ? ' sel' : ''}" data-i="${i}">
+      ${bulk ? `<input type="checkbox" class="ck" data-key="${esc(it.key)}"${state.jira.checked.has(it.key) ? ' checked' : ''}>` : ''}
       <span class="key">${esc(it.key)}</span>
       <span class="title">${esc(it.summary)}</span>
       <span class="meta">${esc(it.status)} · ${esc(it.assignee || '—')} · ${esc((it.updated || '').slice(0, 10))}</span>
@@ -369,6 +381,42 @@ function renderJiraRows() {
     renderJiraRows();
     openJiraIssue(items[i].key);
   });
+  b.querySelectorAll('.ck').forEach(c => c.addEventListener('click', e => {
+    e.stopPropagation();
+    const k = c.dataset.key;
+    c.checked ? state.jira.checked.add(k) : state.jira.checked.delete(k);
+    setStatus(state.jira.checked.size + ' SELECTED');
+    const bc = $('#bulk-count'); if (bc) bc.textContent = state.jira.checked.size + ' SELECTED';
+  }));
+  const bt = $('#bulk-trans');
+  if (bt) bt.onclick = bulkTransition;
+}
+
+async function bulkTransition() {
+  const keys = [...state.jira.checked];
+  if (!keys.length) { toast('NOTHING SELECTED', 'err'); return; }
+  try {
+    const d = await api('/api/jira/issue/' + encodeURIComponent(keys[0]));
+    const trans = d.transitions || [];
+    if (!trans.length) { toast('NO TRANSITIONS ON ' + keys[0], 'err'); return; }
+    const menu = trans.map((t, i) => `${i + 1}) ${t.name}`).join('\n');
+    const pick = prompt('TRANSITION ' + keys.length + ' ISSUE(S) TO:\n' + menu + '\n\nENTER NUMBER');
+    const t = trans[+pick - 1];
+    if (!t) return;
+    const ok = await confirmDialog('[ BULK ] TRANSITION',
+      keys.length + ' ISSUE(S) WILL MOVE TO "' + t.name + '".\nPROCEED?');
+    if (!ok) return;
+    const r = await api('/api/jira/transition', {
+      method: 'POST', body: { keys, transition_id: t.id },
+    });
+    if (r.errors && r.errors.length) {
+      toast(r.errors.length + ' FAILED: ' + r.errors[0].error, 'err');
+    } else {
+      toast(keys.length + ' ISSUE(S) TRANSITIONED', 'ok'); blip(1320, .05);
+    }
+    state.jira.checked.clear();
+    await loadJiraIssues();
+  } catch (e) { /* toast shown */ }
 }
 
 async function openJiraIssue(key) {
@@ -699,6 +747,7 @@ function newJiraIssue() {
 
 async function loadProjects() {
   try { state.projects = await api('/api/jira/projects'); } catch (e) { state.projects = []; }
+  if (state.tab === 'jira' && state.jira.view === 'boards') renderJiraBoardHead();
 }
 
 /* ============ JIRA BOARDS ============ */
@@ -721,7 +770,10 @@ function renderJiraBoardHead() {
     <select id="b-board"><option value="">— PICK PROJECT FIRST —</option>${boardOpts}</select>
     <label>SPRINT</label>
     <select id="b-sprint"><option value="">— PICK BOARD FIRST —</option>${sprintOpts}</select>
-    <div class="btn-row"><button id="b-load" class="act primary">[ LOAD BOARD ]</button></div>`;
+    <div class="btn-row">
+      <button id="b-load" class="act primary">[ LOAD BOARD ]</button>
+      <button id="b-group" class="act">[ GROUP: ${j.group.toUpperCase()} ]</button>
+    </div>`;
   document.querySelectorAll('#list-head [data-view]').forEach(b =>
     b.addEventListener('click', () => { state.jira.view = b.dataset.view;
       if (state.jira.view === 'boards') renderJiraBoardHead();
@@ -754,6 +806,10 @@ function renderJiraBoardHead() {
     renderJiraBoardHead();
   });
   $('#b-load').addEventListener('click', loadBoard);
+  $('#b-group').addEventListener('click', () => {
+    j.group = j.group === 'status' ? 'epic' : 'status';
+    if (j.sprint) loadBoard(); else renderJiraBoardHead();
+  });
 }
 
 async function loadBoard() {
@@ -764,7 +820,7 @@ async function loadBoard() {
     const cards = await api('/api/jira/sprints/' + encodeURIComponent(j.sprint.id) + '/issues');
     const cols = new Map();
     for (const c of cards) {
-      const s = c.status || 'UNKNOWN';
+      const s = j.group === 'epic' ? (c.epic || 'NO EPIC') : (c.status || 'UNKNOWN');
       if (!cols.has(s)) cols.set(s, []);
       cols.get(s).push(c);
     }
@@ -791,7 +847,7 @@ function renderBoard() {
   $('#detail-body').innerHTML = `
     <div class="detail-head">
       <h1>BOARD // ${esc(j.board ? j.board.name : '')} — ${esc(j.sprint ? j.sprint.name : '')}</h1>
-      <div class="sub">${esc(j.sprint ? j.sprint.state : '')} · ${j.columns.reduce((n, c) => n + c.issues.length, 0)} CARD(S) · [ / ] MOVE CARD · J/K NAV · ENTER OPEN</div>
+      <div class="sub">${esc(j.sprint ? j.sprint.state : '')} · GROUP ${esc(j.group.toUpperCase())} · ${j.columns.reduce((n, c) => n + c.issues.length, 0)} CARD(S) · [ / ] MOVE CARD · J/K NAV · ENTER OPEN</div>
     </div>
     <div class="board">${j.columns.map((c, s) => `
       <div class="board-col">
@@ -812,6 +868,7 @@ function renderBoard() {
 
 async function moveBoardCard(dir) {
   const j = state.jira;
+  if (j.group === 'epic') { toast('EPIC SWIMLANES: MOVE DISABLED', 'info'); return; }
   const { s, i } = j.bsel;
   if (s < 0 || i < 0 || !j.columns[s]) return;
   const ns = s + dir;
@@ -1252,7 +1309,16 @@ function moveSel(dir) {
   s.sel = Math.max(0, Math.min(list.length - 1, (s.sel < 0 ? (dir > 0 ? -1 : 0) : s.sel) + dir));
   const b = box();
   vlistEnsureVisible(b, s.sel);
-  if (state.tab === 'jira') renderJiraRows(); else renderConfRows();
+  if (state.tab === 'jira') {
+    renderJiraRows();
+    // prefetch detail so ENTER feels instant; raw fetch = no error toasts
+    const it = list[s.sel];
+    if (it) fetch('/api/jira/issue/' + encodeURIComponent(it.key)).catch(() => {});
+  } else {
+    renderConfRows();
+    const p = list[s.sel];
+    if (p) fetch('/api/confluence/page/' + encodeURIComponent(p.id)).catch(() => {});
+  }
 }
 
 /* ============ gutter drag ============ */
